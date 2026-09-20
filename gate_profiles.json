@@ -1,0 +1,36 @@
+{
+  "_说明": "主题闸门配置。每个 profile = 2~3 个闸门（轴），每轴约 50 词；命中全部轴才通过。没有黑名单。",
+  "_用法": "python topic_gate.py --list-profiles ；python topic_gate.py --explain \"标题\" --profile <id>",
+  "_重要": "下面这个 profile 只是【结构示例】，仅演示配置尺度。正式检索前必须为本次题目另建 profile：2~3 个轴、每轴约 50 词，写进本文件后即可用 --profile <id> 调用。",
+  "profiles": {
+    "example-time-series-forecasting": {
+      "id": "example-time-series-forecasting",
+      "topic": "示例：时间序列预测",
+      "axes": {
+        "对象数据": [
+          "time series", "temporal", "sequence", "univariate", "multivariate",
+          "sensor", "signal", "trend", "seasonality", "seasonal",
+          "periodicity", "cyclical", "stationarity", "non-stationary",
+          "autocorrelation", "lag", "sliding window", "lookback",
+          "horizon", "missing value", "imputation", "irregular sampling",
+          "high frequency", "low frequency", "noise", "outlier", "anomaly",
+          "drift", "regime change", "change point", "resampling",
+          "normalization", "scaling", "feature engineering", "timestamp",
+          "panel data", "cross-sectional", "streaming", "online", "real-time"
+        ],
+        "方法模型": [
+          "forecasting", "prediction", "arima", "sarima", "arimax",
+          "exponential smoothing", "holt-winters", "theta method",
+          "state space", "kalman", "particle filter", "prophet",
+          "regression", "ridge", "lasso", "gradient boosting", "xgboost",
+          "random forest", "svr", "gaussian process", "lstm", "gru", "rnn",
+          "temporal convolution", "tcn", "transformer", "attention",
+          "informer", "autoformer", "fedformer", "patchtst", "dlinear",
+          "n-beats", "deepar", "graph neural", "gnn", "spatio-temporal",
+          "decomposition", "wavelet", "fourier", "emd", "vmd",
+          "probabilistic", "quantile", "interval forecast", "mse", "mape"
+        ]
+      }
+    }
+  }
+}
