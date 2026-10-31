@@ -161,7 +161,7 @@ rep = searcher.search_report()       # 结构化数据，写入调研日志
 | 失败后部分结果丢失 | 翻页中断时 `return` 未执行（v1.3.4 已修） | 捕获异常后必须用 `searcher.collected_partial()` 取回并落盘 |
 | 结果大量 off-topic | 关键词过宽（如泛用 GPR/thermal） | 缩窄查询词，对标题做相关性打分后再呈现 |
 | 分区大量 unknown | 该刊未被分区库收录 | 属预期，说明局限；需要中文分区时改用 `--letpub --issn <ISSN>` 重查 |
-| 输出目录不符预期 | 默认 `F:\Agent\DeepseekHarness\Interaction` | 设 `LITSEARCH_OUT_DIR`，或按 `AGENTS.md` 归档规范指定 |
+| 输出目录不符预期 | 默认 `~/literature-search-out` | 设 `LITSEARCH_OUT_DIR`，或按 `AGENTS.md` 归档规范指定 |
 
 ## 资源导航
 

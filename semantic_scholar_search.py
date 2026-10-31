@@ -58,10 +58,11 @@ def _load_env_from_dsh_env() -> None:
 
 _load_env_from_dsh_env()
 
-# 输出目录：可用环境变量 LITSEARCH_OUT_DIR 覆盖；默认 F:\Agent\DeepseekHarness\Interaction（自动创建）
+# 输出目录：可用环境变量 LITSEARCH_OUT_DIR 覆盖；默认 ~/literature-search-out（自动创建）
+# 默认值不含任何机器专属路径，换机器或给别人用都能直接跑
 DEFAULT_SAVE_DIR = os.getenv(
     "LITSEARCH_OUT_DIR",
-    r"F:\Agent\DeepseekHarness\Interaction"
+    os.path.join(os.path.expanduser("~"), "literature-search-out"),
 )
 
 

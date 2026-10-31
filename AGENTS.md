@@ -1001,7 +1001,7 @@ Semantic Scholar 失败时，**不得自行改用 Crossref 或其他源**。必�
 | 脚本十几分钟不结束 | 自定义脚本用了过长退避且未上报 | 删除自定义长退避，改用 skill 内置 `RETRY_WAITS_S`（10/10，共 3 次请求，累计约 20 秒） |
 | 结果大量 off-topic | 查询词过宽 | 缩窄查询词，加相关性打分与人工筛选 |
 | 分区大量 unknown | 期刊未被分区库收录 | 属预期；说明局限，必要时人工补录 |
-| 保存目录不符预期 | 默认落在 `F:\Agent\DeepseekHarness\Interaction` | 设 `LITSEARCH_OUT_DIR`，或按第 6 节规范传 `save_dir` |
+| 保存目录不符预期 | 默认落在 `~/literature-search-out` | 设 `LITSEARCH_OUT_DIR`，或按第 6 节规范传 `save_dir` |
 | 翻译未生效但结果正常 | 缺 `ANTHROPIC_AUTH_TOKEN` | 属预期的降级行为，保留英文即可 |
 | 技能目录出现多余 HTML 文件 | `journal_quartile.py` 调 `searchts get` 的残留 | 定期清理；分区查询完毕检查当前工作目录 |
 | 目标 docx 无法覆盖保存 | 文件被 WPS/Word 占用 | 另存新文件，或请用户关闭文档 |

@@ -97,7 +97,7 @@ BGE 模型首次使用会自动下载（约 400 MB），之后本地缓存。
 | `SEMANTIC_SCHOLAR_API_KEY` | 必需 |
 | `ELS_API_KEY` | Elsevier 摘要补全 |
 | `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` | 标题与摘要翻译（可选） |
-| `LITSEARCH_OUT_DIR` | 覆盖默认输出目录（可选） |
+| `LITSEARCH_OUT_DIR` | 覆盖默认输出目录（默认为 `~/literature-search-out`） |
 
 ---
 
@@ -119,6 +119,10 @@ BGE 模型首次使用会自动下载（约 400 MB），之后本地缓存。
 
 产出：一张 Excel（含 DOI、摘要、分区、疑似会议标记等），外加一份检索完整性报告。
 之后可以让它按需读这张表，不必整表塞进上下文。
+
+**输出位置**：默认写到 `~/literature-search-out/`（Windows 上是
+`C:\Users\<你的用户名>\literature-search-out\`）。想换地方就设 `LITSEARCH_OUT_DIR`，
+或在调用时传 `save_dir`。
 
 ---
 
