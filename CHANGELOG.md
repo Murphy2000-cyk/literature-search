@@ -3,6 +3,41 @@
 本项目的版本号描述**检索行为与产出格式的变化**。每条都附了当初的实测依据 ——
 这个 skill 的绝大多数设计取舍来自实测踩坑，而不是先验推理。
 
+## v2.0.0
+
+**分区口径重做，并补上摘要与会议论文集两块长期缺口。**
+
+### 新增
+
+- **摘要补全 `abstract_fill.py`**：S2 自带摘要覆盖率约 84%，缺的几乎全是 Elsevier
+  （2019 年起不向第三方提供摘要）。五源逐级兜底：Crossref → OpenAlex → Elsevier API →
+  PubMed（按 DOI 反查 PMID）→ 页面渲染。实测覆盖率由 80% 提到 **98%**。
+  Elsevier 通道无权限时仍返回 HTTP 200，判据看「有没有 `dc:description` 字段」而非状态码。
+- **会议论文集识别 `venue_rules.py`**：`publicationTypes` 挡不住会议论文集——实测 553 篇里
+  标 `Conference` 的仅 27 篇，另有 **99 篇刊名明显是会议论文集**却标 `JournalArticle`
+  （e-Journal of NDT 47 篇、Italian National Conference on Sensors 16 篇等）。
+  按刊名规则判定，并带白名单避免误杀 `Proceedings of the Institution of ...` 这类正规期刊。
+- **`evals/test_abstract_fill.py`、`evals/test_venue_rules.py`**：两块新能力的自测。
+
+### 变更
+
+- **分区改为中科院《新锐期刊分区表》（LetPub，1–4 区）**，删除 JCR 分支。
+  JCR 无免费数据源，第三方站点给的是自算四分位，拿来当 JCR 汇报会出错。
+- **每轮取 500 篇（5 页）**，单查询仍受平台 `offset + limit ≤ 1000` 的硬上限约束。
+- **LetPub 抓取改为 curl_cffi 优先**：单本 7.0~9.3 s 降到 2.6~3.6 s，215 本刊从约 29 分钟降到约 10 分钟。
+
+### 修复
+
+- **分区缓存毒化**：LetPub 偶发返回空页，旧实现把 `None` 永久写进缓存，
+  导致 215 本刊里 185 本被判「未收录」。现改为未收录项 30 天 TTL 后自动重查。
+- `--select` 此前只影响显示，`--out` 导出仍给全部列；现在两者一致（v1.9.1 已修，此处并入）。
+
+### 破坏性变更
+
+- `--quartile` → `--zone`，`--enrich-quartile` → `--enrich-zone`
+- 分区取值 `Q1`/`Q2` → `1`/`2`/`3`/`4`
+- 传旧值一律**报错并提示**，不会静默返回空表
+
 ## v1.9.1
 
 - **修正 `paper_table.py --select` 的作用范围**：此前 `--select` 只影响显示，

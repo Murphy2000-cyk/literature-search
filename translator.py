@@ -426,9 +426,9 @@ def test_translate():
     print("=" * 50)
 
     test_titles = [
-        "Chain-of-thought prompting improves multi-step reasoning accuracy",
-        "Chain-of-thought prompting for multi-step reasoning in large language models",
-        "A survey of evaluation benchmarks for large language model reasoning",
+        "Infrared thermography for building facade inspection",
+        "Deep learning approaches to non-destructive testing of external wall insulation",
+        "A review of ground penetrating radar applications in civil engineering",
     ]
     print(f"\nTranslating {len(test_titles)} titles...")
     results = translate_titles(test_titles)
@@ -438,7 +438,7 @@ def test_translate():
         print()
 
     test_abstracts = [
-        "This paper presents a comprehensive review of chain-of-thought prompting techniques for improving multi-step reasoning accuracy.",
+        "This paper presents a comprehensive review of infrared thermography techniques for detecting delamination in building facades.",
     ]
     print(f"Translating {len(test_abstracts)} abstracts...")
     results = translate_abstracts(test_abstracts)

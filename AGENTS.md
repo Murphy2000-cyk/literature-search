@@ -41,8 +41,8 @@ Phase 2 允许用户**直接报论文标题**，用 `find_paper_id_by_title()` �
 | `semantic_scholar_search.py` | 主流程：检索、分页、合并去重、筛选、分区集成、保存；含失败重试与上报 |
 | `paper_details.py` | Phase 2：按 paper_id/标题批量取详情并翻译 |
 | `translator.py` | DeepSeek Flash 批量翻译（标题 30 条/批、摘要 5 条/批，关闭推理链）。无推理链、纯翻译，速度快，学术术语处理良好 |
-| `journal_quartile.py` | JCR 分区查询（journalmetrics.org，带本地缓存） |
-| `relevance_scorer.py` | BGE 多组关键词相关性排序（**`bge-base`，与本机另一套 BGE 服务同一套模型**；`rank_groups()` 支持每组独立评分后全局排序；**`lang="en"` 固定英文分支**） |
+| `journal_quartile.py` | 分区查询。**只做 LetPub 中科院《新锐期刊分区表》（1–4 区，`letpub_zone`）**；JCR 无免费数据源，v2.0 起不再提供（原 journalmetrics 那套已删除） |
+| `relevance_scorer.py` | BGE 多组关键词相关性排序（**`bge-base`，与结构化知识库同一套模型**；`rank_groups()` 支持每组独立评分后全局排序；**`lang="en"` 固定英文分支**） |
 | `search_pipeline.py` | **一步流程**：检索 → BGE 每组独立评分 → 合并排序 → 落盘 Excel（内存生命周期见 §3.6） |
 | `bge_status.py` | **查看本机 BGE 占用**：谁在跑、中文/英文分支、各占多少内存；含"怎么单独关掉英文侧"的操作说明 |
 | `crossref_fallback.py` | **备用数据源**：仅在用户同意后使用（带门禁）；只覆盖有 DOI 文献 |
@@ -58,8 +58,8 @@ Phase 2 允许用户**直接报论文标题**，用 `find_paper_id_by_title()` �
 | 年份 | 近 10 年 | 传 `year_range=(2016, 2026)` |
 | 预印本 | **排除** | `paper_type="all"` |
 | 会议论文 | **排除** | `paper_type="all"` 或 API 层 `publication_types` |
-| 分区 | **不筛选** | 显式传 `quartile_filter=["Q1","Q2"]`；检索阶段分区本来就是空的 |
-| **写入元数据表的篇数上限** | **200** | `DEFAULT_TOTAL_LIMIT` / `save_papers_xlsx(total_limit=N)` / CLI `--top N`（0 = 不限） |
+| 分区 | **不筛选**（中科院新锐分区，1–4 区） | 显式传 `quartile_filter=["1","2"]`；检索阶段分区本来就是空的 |
+| **写入元数据表的篇数上限** | **不限（None）** | `DEFAULT_TOTAL_LIMIT` / `save_papers_xlsx(total_limit=N)` / CLI `--top N`（None 与 0 = 不限） |
 | 每个查询取回的上限 | 100（= 一页，API 单页上限） | `search_paginated(total_limit=N)` |
 | 单查询结果硬上限 | **1000 条**（`offset + limit ≤ 1000`，平台限制，旧文档的 10000 已失效） | 无法覆盖；需要更多须改用 `/paper/search/bulk`（分页至千万级，且支持布尔语法） |
 | 查询语法 | **纯文本关键词，无布尔语法**（写 `AND`/引号会被当普通文本） | 需要 `+` / `\|` / `-` / `""` / `*` / `~N` 须改用 `/paper/search/bulk` |
@@ -73,19 +73,19 @@ Phase 2 允许用户**直接报论文标题**，用 `find_paper_id_by_title()` �
 1. **`paper_type="journal_only"` 的语义 = 「非会议 + 非预印本」**，
    **不再**要求 `is_journal=True`。旧实现在此多一条强制条件，会把
    S2 没返回 `publicationTypes` 的正常期刊论文**静默丢掉**（实测确认的漏检点）。
-2. **分区默认不筛**。旧默认 `["Q1","Q2"]` 是个顺序陷阱：检索阶段 `paper.quartile` 为空，
+2. **分区默认不筛**（口径已改为中科院 1–4 区）。旧默认 `["Q1","Q2"]` 是个顺序陷阱：检索阶段 `paper.quartile` 为空，
    靠 `filter_papers` 里 `and paper.quartile` 侥幸没生效；一旦改成"先 `enrich_quartiles()`
-   查分区、再 `filter_papers()`"，就会突然按 Q1/Q2 砍掉大量文献。
+   查分区、再 `filter_papers()`"，就会突然按分区砍掉大量文献。传 `Q1/Q2` 会直接报错（旧 JCR 口径已不再提供）。
    现在 `DEFAULT_QUARTILE_FILTER = None`，**要按分区筛必须显式传**。
 
 **⚠️ 两个"上限"不要混淆（v1.7.1 澄清）**：
 
 | 概念 | 常量 / 参数 | 默认 | 含义 |
 |---|---|---|---|
-| **写入表的篇数上限** | `DEFAULT_TOTAL_LIMIT` / `total_limit` / `--top` | **200** | 所有查询**合并去重之后**取前 N 篇；**候选不足 N 篇则有多少存多少**（不补齐、不报错）；传 0 表示不限 |
+| **写入表的篇数上限** | `DEFAULT_TOTAL_LIMIT` / `total_limit` / `--top` | **不限（None）** | 所有查询**合并去重之后**取前 N 篇；**候选不足 N 篇则有多少存多少**（不补齐、不报错）；传 0 表示不限 |
 | 每个查询取回的上限 | `search_paginated(total_limit=N)` | 100 | **单个查询**最多取多少条，100 = 一页 |
 
-例：6 个查询 × 每查询 100 条 = 最多 600 条候选 → 合并去重 → **取前 200 条入表**。
+例：4 轮 × 每轮 500 篇（5 页）= 最多 2000 条候选 → 合并去重 → 过闸门 → **全量入表（不截断）**。
 `search_paginated` 的参数叫 `total_limit` 是指"该查询的总上限"，**不是**全表总数
 （v1.7.1 之前文档把两者写混了，此处为准）。
 
@@ -95,12 +95,13 @@ Phase 2 允许用户**直接报论文标题**，用 `find_paper_id_by_title()` �
 
 ### 3.1 环境准备
 
-**Python 依赖**（首次使用需安装）：
+**Python 依赖**（首次使用需安装；本机第三方包装进 conda 环境 `E:\Anaconda3\envs\py313`）：
 
 ```bash
-pip install requests sentence-transformers torch numpy
+& "E:\Anaconda3\envs\py313\python.exe" -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple requests sentence-transformers torch numpy
 ```
 
+脚本内已 `sys.path.insert` 该目录；也可用 `PYTHONPATH` 引入。
 `requests` 必需；`sentence-transformers` + `torch` 仅 BGE 排序用，缺失时跳过排序（属降级，不算失败）。
 
 **API Key 获取与配置**：
@@ -128,8 +129,7 @@ pip install requests sentence-transformers torch numpy
 ```python
 # -*- coding: utf-8 -*-
 import sys, os, json
-SKILL_DIR = r"<技能资源基底>"          # 宿主给出的本 skill 目录
-sys.path.insert(0, SKILL_DIR)
+sys.path.insert(0, r"C:\Users\lenovo\.agents\skills\literature-search")
 
 from semantic_scholar_search import (
     SemanticScholarSearcher, filter_papers, save_filtered_results,
@@ -137,7 +137,7 @@ from semantic_scholar_search import (
 )
 from relevance_scorer import RelevanceScorer
 
-OUT = r"<调研根目录>\记录\<日期>_<主题>"
+OUT = r"F:\Agent\DeepseekHarness\AcademicResearch\记录\<日期>_<主题>"
 QUERIES = ["...", "..."]        # 3 到 6 组英文关键词
 
 searcher = SemanticScholarSearcher()
@@ -195,9 +195,9 @@ python paper_details.py --file ids.txt
 
 ```bash
 python crossref_fallback.py --approved-by-user --out "<归档目录>" \
-  --keywords "reasoning,chain-of-thought,arithmetic" \
-  "logical reasoning benchmark evaluation" \
-  "large language model multi-step reasoning"
+  --keywords "nonlinear,contact,debonding,delamination,harmonic" \
+  "breathing crack nonlinear vibration damage detection" \
+  "contact acoustic nonlinearity interface debonding"
 ```
 
 编程调用（`approved_by_user=True` 必填）：
@@ -239,7 +239,7 @@ save_crossref(papers, OUT, prefix="crossref", min_rel=3)
 
 | 取法 | 前 100 条中相关条目 | 内容特征 |
 |---|---|---|
-| 无 cursor | 44 / 100 | 完全对题 |
+| 无 cursor | 44 / 100 | 完全对题（contact acoustic nonlinearity 等） |
 | `cursor=*`（**漏 sort**） | **1 / 100** | 牙种植体界面、超声心动图、白细胞活化等**完全无关**内容 |
 | `cursor=*` + `sort=relevance` | 44 / 100 | 与"无 cursor"首页标题集合**完全相同** |
 | 无 cursor，`rows=1000` | 280 / 1000 | 相关性正常 |
@@ -259,7 +259,7 @@ save_crossref(papers, OUT, prefix="crossref", min_rel=3)
 | 证据 | 内容 |
 |---|---|
 | 官方/指南口径 | `/paper/search` = "Relevance-ranked paper search"，**"plain text only. No advanced boolean syntax."** |
-| 中文实测 | 用一个中文主题词查询，返回的是**标题中含中文字符**的文献 → 词法匹配，非跨语言语义理解 |
+| 中文实测 | 查询 `脱粘 非线性 振动`，返回的是**标题中含中文字符**的文献 → 词法匹配，非跨语言语义理解 |
 
 注意区分：S2 确实有 SPECTER2 向量，但那是**可请求的字段**（`embedding.specter_v2`）与
 Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
@@ -278,14 +278,14 @@ Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
 #### 3.5.3 匹配范围 = 标题 + 摘要（已实测确认）
 
 **结论：摘要被索引。** 因此查询词可以放心包含只在摘要中出现的技术/方法术语
-（如某个只在摘要里出现的具体方法名），有助于提高召回。
+（如 `impedance`、`thermography`），有助于提高召回。
 
 **验证方法（可复现）**：取一篇已知论文的摘要，挑出**逐字只存在于摘要、标题中完全没有**的词组
-（实测取一篇已知论文摘要中**逐字只存在于摘要**的 5 个词，其中含一个疑似原文拼写错误的生僻词），
+（实测用 `monocity valid certain size limit`；其中 `monocity` 疑似原文拼写错误、泛用性极低），
 用该词组检索 —— 目标论文**排在第 1 位**，证明摘要参与了匹配。
 
 > **方法论提醒（此结论曾一度测错）**：此类验证**必须带对照组**。
-> 实测中先用两个**泛用词**单独测试，均未召回目标论文，一度误判为"摘要未索引"；
+> 实测中先用单词 `quantification`、`monocity` 测试，均未召回目标论文，一度误判为"摘要未索引"；
 > 真实原因是这些词过于泛用（结果集达 293 ~ 206 万条），
 > **泛用查询下的"缺席"不构成证据**。只有"逐字唯一的词组 + 结果集足够小"才有效。
 
@@ -293,8 +293,8 @@ Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
 
 | 查询 | 结果数 | 目标论文 |
 |---|---|---|
-| 5 个词全部逐字命中标题 | 43 | **rank 1** |
-| 5 个词为摘要中逐字唯一的词组 | **538** | **rank 1** |
+| `breathing type debonding stiffened panel`（标题词） | 43 | **rank 1** |
+| `monocity valid certain size limit`（摘要唯一词组） | **538** | **rank 1** |
 
 第二行是关键：若为严格 AND，逐字唯一的词组应只返回 1 条。返回 538 条说明引擎**按词命中程度排序**，
 全命中的排最前，但**不是硬性过滤器**。
@@ -311,12 +311,12 @@ Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
 
 | 查询 | 词数 | 实际返回 |
 |---|---|---|
-| 查询 A | 7 | **100** |
-| 查询 A + 2 个词 | 9 | **11** |
-| 查询 A + 6 个词 | 13 | **6** |
-| 查询 B | 7 | **92** |
-| 查询 B + 2 个词 | 9 | **6** |
-| 查询 C（另一组 7 词，含生僻词） | 7 | **7** |
+| `external thermal insulation composite system non-destructive testing` | 7 | **100** |
+| 上一行 + `debonding detection` | 9 | **11** |
+| `impact echo ultrasonic acoustic ground penetrating radar insulation debonding detection` | 13 | **6** |
+| `infrared thermography building facade insulation defect detection` | 7 | **92** |
+| 上一行 + `wall` `delamination` | 9 | **6** |
+| `active thermography delamination detection building facade cladding` | 7 | **7** |
 
 关键读数：**第 2 行只是第 1 行加了两个词，返回量从 100 掉到 11。**
 所以"多写几个词让检索更精确"在这里是**反效果**：越精确越接近 0 条。
@@ -344,18 +344,18 @@ Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
 
 | 现象 | 实例 |
 |---|---|
-| 纯综述排到第 2 | 一篇与题目无关的综述排到第 2（BGE 0.6480，通篇不含目标方法） |
-| 完全无关领域混入 | 另外三个学科里撞名的术语论文被排进前排 |
-| 最对题的被压低 | 三篇真正对题的论文分别被压到 18（0.6044）、25（0.5839）、33（0.5621） |
+| 纯综述排到第 2 | `External Thermal Insulation Composite Systems (ETICS) from Industry and Academia Perspective`（BGE 0.6480，全文不含任何无损检测内容） |
+| 完全无关领域混入 | 电气设备热像、钢管道保温层、飞机电缆绝缘层、运动生理学热像 |
+| 最对题的被压低 | `GPR 智能识别外保温层粘结状态` 排 18（0.6044）、`保温层成像雷达` 排 25（0.5839）、`ETICS 脱粘非线性振动` 排 33（0.5621） |
 
 **因此：BGE 排序只能当候选排序，不能直接当最终交付。** 必须在排序之后加两道：
 
 1. **主题闸门** —— 已固化为 skill 模块 **`topic_gate.py`**（用户 2026-09-20 定稿）。
 
    ⚠️ **闸门是按主题配置的，不是一套词表打天下。**
-   内置的 `example-llm-reasoning` 只覆盖一个题目；
-   实测拿它去判别的题目：题目 B **0/4**、题目 C **0/3**、
-   题目 D **0/3**（合计 3/13）—— 整套词表只对得上一个题目。
+   内置的 `building-envelope-ndt` 只覆盖「建筑围护结构/外保温无损检测」；
+   实测拿它去判别的题目：脱粘界面非线性振动 **0/4**、FEM+神经网络 **0/3**、
+   光纤外立面检测 **0/3**（合计 3/13）—— 整套词表只对得上一个题目。
 
    **每次检索都要为本次题目准备一条 profile**，存进同目录 `gate_profiles.json`
    （`save_profile()` 或 `build_profile()` 写入）。
@@ -369,17 +369,19 @@ Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
    ⚠️ **没有黑名单**（用户 2026-09-20 定稿）。排除非目标领域靠**选好轴里的词**，
    不再加排除表 —— 机制越多、误杀面越大。
    实测：去掉黑名单后，同一候选池通过数由 109 → **120**（+11），
-   因为黑名单本身也在误杀（例：排除词 `net` 命中 `Inter**net**` 这类偶然重合）。
+   因为黑名单本身也在误杀（例：`vehicle` 命中 `Unmanned Aerial **Vehicle**`，
+   而无人机恰恰是建筑巡检的合法平台）。
 
    轴不要超过 3 个 —— 每多一轴，"必须全中"的合取更紧，误杀风险越高。
    建议两轴：`方法/信号` + `对象/领域`。
 
-   **内置的两套示例配置**：
+   **已有的三套配置**：
 
    | id | 轴 | 每轴词数 |
    |---|---|---|
-   | `example-llm-reasoning`（内置示例） | 对象方法 ∧ 任务评测 | 47 + 47 |
-   | `example-time-series-forecasting` | 对象数据 ∧ 模型方法 | 40 + 47 |
+   | `building-envelope-ndt`（内置） | 检测方法 ∧ 对象领域 | 53 + 57 |
+   | `debonding-nonlinear-vibration` | 对象现象 ∧ 方法信号 | 43 + 56 |
+   | `fem-neural-network` | 数值方法 ∧ 学习方法 | 46 + 44 |
 
    **实测效果（同一 660 篇候选池）**：
    最初的三条件合取闸门 37 篇 → 692 词巨表 + 黑名单 109 篇 →
@@ -387,26 +389,26 @@ Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
    相对最初**放回 83 篇、漏掉 0 篇**。
    **110 个词的闸门打败了 692 个词的巨表**，而且机制更简单、不新增误杀。
 
-   ⚠️ **没有黑名单的已知取舍**：别的领域里撞名的标题会一并放行
-   （它们的标题里确实有目标词）。实测它们 BGE 分普遍低于真领域论文
-   （0.6096，而真领域论文前排 0.62~0.66），
+   ⚠️ **没有黑名单的已知取舍**：电气绝缘、管道保温这类同名标题会一并放行
+   （它们的标题里确实有 `insulation`）。实测它们 BGE 分普遍低于真领域论文
+   （`Gas Insulation Switch` 0.6096，而真领域论文前排 0.62~0.66），
    所以由后续排序 + 人工复核兜住。这是"不要误杀"取向下的自觉选择。
 
-   ⚠️ **短词（≤5 字符）必须用词边界匹配** —— 纯子串会把 sto`**`rag`**`e` 当成 `rag`、
-   `w`**`all`**`et` 当成 `wall`，实测因此把 3 篇不相关的论文误放进闸门。
+   ⚠️ **短词（≤5 字符）必须用词边界匹配** —— 纯子串会把 `re`**`nde`**`ring` 当成 `nde`、
+   `w`**`all`**`et` 当成 `wall`，实测因此把 3 篇"ETICS 抗冰雹/耐久性"误放进闸门。
    （实现上给了可选复数 `s?`，`wall` 即覆盖 walls。）
 
-   ⚠️ **词干别当词边界词用**。实测：把 `model` 当词位时（5 字符走词边界），
-   `modelling`/`modelled` **都匹配不上**（后面还跟着 `l`），一口气误杀 5 篇。
-   正确写法是完整词或更长的词干（长度 >5 会自动走子串匹配）。
+   ⚠️ **词干别当词边界词用**。实测：把 `facad` 当词位时，`facade`/`facades`
+   **都匹配不上**（`facad` 后面还跟着 `e`），一口气误杀 5 篇幕墙论文。
+   正确写法是完整词 `facade`（长度 >5 会自动走子串匹配，覆盖单复数与 `façade`）。
 
-   ⚠️ **匹配前先折叠重音**（`naïve` → `naive`），词表里写 ASCII 拼法即可命中带重音的写法。
+   ⚠️ **匹配前先折叠重音**（`façade` → `facade`），一个词位就能覆盖两种拼写。
 
    **过窄自检**：`apply_gate()` 在放行率低于阈值（默认 ≥20 篇且 ≥10%）时返回告警，
    提示"主题配置过窄、正在误杀"，而不是"该领域没有相关文献"。
    交付前必须先人工翻看 rejected 前若干条。
 
-2. **人工复核**：闸门后仍可能有泛领域论文（别的学科撞名、同一技术的别种应用）排在
+2. **人工复核**：闸门后仍可能有泛领域热像（幕墙污渍、相机选型评估）排在
    领域专指论文之前。按既定做法人工调整并**留痕说明**，
    **不得改动打分数值**；闸门配置与真实分数须落盘（如 `主题闸门_v3对比.json`）供回溯。
 
@@ -420,11 +422,11 @@ Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
 
 | 查询 | `total` |
 |---|---|
-| 1 个词 | 27,604 |
-| 同一查询 + 1 个词 | **1,803,131** ← 涨 **65 倍** |
-| 再 + 1 个词 | 62,460 |
-| 再 + 1 个词 | 2,633 |
-| 再 + 1 个词 | 31 |
+| `debonding` | 27,604 |
+| `debonding nonlinear` | **1,803,131** ← 加一个词涨 **65 倍** |
+| `debonding nonlinear vibration` | 62,460 |
+| `debonding nonlinear vibration interface` | 2,633 |
+| `debonding nonlinear vibration interface stiffened` | 31 |
 
 加词导致结果暴涨 65 倍，逻辑上不可能是 AND；且重复测量稳定复现（1,803,131 / 1,803,134），
 **不是随机噪声**。官方文档亦明确说明 `total` 是**近似值**，不应视为精确的语料计数。
@@ -439,7 +441,7 @@ Recommendations API 的机制，**不是** `/paper/search` 的匹配方式。
 | ✅ 可包含方法/技术术语 | 因摘要被索引，能提升召回 |
 | ❌ 不要写布尔语法 | 会被当普通文本 |
 | ❌ 不要用 `total` 报覆盖率 | 数值不可信 |
-| ⚠️ 中文可查但噪声大 | 实测用一个中文主题词查询，首条结果与查询完全无关 |
+| ⚠️ 中文可查但噪声大 | 实测 `脱粘 非线性 振动` 的首条结果与查询完全无关 |
 | 🔁 需要精确控制 / 大规模召回 | 改用 `/paper/search/bulk` |
 
 **对现有代码的结论**：`semantic_scholar_search.py` 一直传纯关键词串、且从未使用 `total` 做汇报，
@@ -468,12 +470,12 @@ python paper_table.py --xlsx <目录>/论文元数据.xlsx --from-json <某结�
 # 之后按需读取，输出刻意做得很小
 python paper_table.py --xlsx <表> --stats                     # 只出统计
 python paper_table.py --xlsx <表> --filter --year-min 2020 --min-citations 10 --limit 20
-python paper_table.py --xlsx <表> --filter --quartile Q1 --select 标题,DOI,年份 --limit 30
+python paper_table.py --xlsx <表> --filter --zone 1 --select 标题,DOI,年份 --limit 30
 python paper_table.py --xlsx <表> --filter --has-abstract --out <筛后.xlsx>
 python paper_table.py --xlsx <表> --selected                  # 读用户勾选的「选中」列
-python paper_table.py --xlsx <表> --enrich-quartile           # 查分区并回填「分区」列
-python paper_table.py --xlsx <表> --enrich-quartile --refresh # 连已有分区一起重查
-python paper_table.py --xlsx <表> --enrich-quartile --quiet   # 只出一行统计（省 token）
+python paper_table.py --xlsx <表> --enrich-zone              # 查中科院分区并回填「中科院分区」列
+python paper_table.py --xlsx <表> --enrich-zone --refresh    # 连已有分区一起重查
+python paper_table.py --xlsx <表> --enrich-zone --quiet      # 只出一行统计（省 token）
 ```
 
 **🪙 省 token：`--quiet` 与 `--top-n`（直接出结果，不经过 Agent 阅读）**
@@ -492,10 +494,10 @@ python paper_table.py --xlsx <表> --enrich-quartile --quiet   # 只出一行统
 
 ```bash
 # 表本身已按 BGE 得分降序，所以 --top-n 取的就是"最相关的前 N 篇"
-python paper_table.py --xlsx <表> --filter --quartile Q1 --top-n 10 \
-    --out <一区前10.md.xlsx> --quiet
+python paper_table.py --xlsx <表> --filter --zone 1 --top-n 10 \
+    --out <一区前10.xlsx> --quiet
 # 输出仅两行：
-#   [QUIET] 筛前 200 | 分区∈['Q1']排除120 | 筛后 80 | 取前 10
+#   [QUIET] 筛前 553 | 中科院分区∈['1']区排除 539 | 筛后 14 | 取前 10
 #   [SAVE] 已导出 10 条 -> ...
 ```
 
@@ -507,7 +509,7 @@ python paper_table.py --xlsx <表> --filter --sort-by 引用数 --desc --top-n 1
 ```
 
 - `--top-n N`：筛选后**只取前 N 条**（`--limit` 只管显示，不管导出；两者不同）
-- `--quiet`：**不打印任何论文明细**，只出一行统计（`--enrich-quartile` 也支持）
+- `--quiet`：**不打印任何论文明细**，只出一行统计（`--enrich-zone` 也支持）
 - `--sort-by 列名 [--desc]`：按指定列排序（数值列按数值排，空值始终排最后）
 
 **📋 只要某几类信息：`--select` 选列（同时作用于显示与导出）**
@@ -534,7 +536,7 @@ python paper_table.py --xlsx <表> --filter --select 标题 --limit 30
 - 选到不存在的列会**直接报错**，不会静默给空表。
 - 可用列名：`序号 / PaperID / DOI / 标题 / 中文标题 / 作者 / 年份 / 期刊 / 分区 / 引用数 /
   BGE分数 / 是否期刊 / 是否会议 / 是否预印本 / PDF链接 / 摘要 / 中文摘要 / 选中`，
-  以及来源特有字段（如 `文献类型`、`被引次数`）。不确定时先跑 `--stats` 看"字段："那一行。
+  以及来源特有字段（如 `文献类型`、`ax_fiber`）。不确定时先跑 `--stats` 看"字段："那一行。
 
 **实测（6 行表）**：只要标题 → `6 条 × 1 列` 的 txt；标题+期刊+分区 → `6 条 × 3 列` 的 xlsx，
 列名正好 `['标题','期刊','分区']`；标题+分区 → 2 列 csv。
@@ -551,7 +553,7 @@ python paper_table.py --xlsx <表> --filter --select 标题 --limit 30
      --stats                      看全局（含字段填充率）
      --filter --select 标题,...    看标题
      --filter --select 摘要        看某几篇摘要
-     --enrich-quartile            查分区并写回表里（走只读的 searchts read）
+     --enrich-zone                查中科院分区并写回表里（走只读的 searchts read）
      --selected                   读用户在表里勾选的「选中」列，进 Phase 2
 ```
 
@@ -609,25 +611,25 @@ python search_pipeline.py --out <目录> --target 200 --no-bge "q1" "q2" "q3"   
 
 **torch 不是全局开关，而是每个 Python 进程各自 `import` 的一份库。**
 本流程所在进程退出时，操作系统只回收该进程的内存，
-**不会触碰**常驻 BGE 服务那个进程里的 torch 与中文模型。
+**不会触碰**知识库常驻服务那个进程里的 torch 与中文模型。
 
 ```
 实验前 : 端口 8767 监听中，PID=25604，832 MB；查询正常（命中 5，返回 9 条）
 实验中 : PID 14992  865 MB   ← 论文检索进程（英文 BGE）
-         PID 25604  832 MB   ← 常驻 BGE 服务（中文 BGE）
+         PID 25604  832 MB   ← 知识库常驻服务（中文 BGE）
 实验后 : 端口 8767 仍监听中，PID 仍是 25604（未被重启），832 MB；查询结果完全一致
 ```
 
 **两个 PID、两份 torch、两份模型，互不影响。**
-但**内存总量会叠加**：常驻服务常驻 832 MB + 论文检索峰值 865~1260 MB ≈ **1.7~2.1 GB**。
-想腾内存可临时停掉那个常驻服务（释放约 825 MB），
-下次用该服务时它会自动拉起。
+但**内存总量会叠加**：知识库常驻 832 MB + 论文检索峰值 865~1260 MB ≈ **1.7~2.1 GB**。
+想腾内存可临时 `python search_reflect.py --stop-daemon`（释放约 825 MB），
+下次用知识库时它会自动拉起。
 
 **怎么看/怎么单独关掉英文侧**：`python bge_status.py`
 
 ```
-【常驻服务侧（中文 BGE，长期驻留）】1 个
-  PID  25604      832 MB  常驻 BGE 服务（中文分支），端口 [8767]
+【知识库侧（中文 BGE，长期驻留）】1 个
+  PID  25604      832 MB  知识库常驻服务（中文分支），端口 [8767]
 【论文检索侧（英文 BGE，跑完即退）】0 个
   （无）
   英文 BGE     :       0 MB   ← 当前没有英文 BGE 在跑（已关）
@@ -638,20 +640,20 @@ python search_pipeline.py --out <目录> --target 200 --no-bge "q1" "q2" "q3"   
 
 关闭英文侧的三条路：
 1. **正常**：什么都不做，论文检索进程跑完自己退出；
-2. **卡住**：`Stop-Process -Id <论文检索侧的 PID>`（只杀那一个，别动常驻服务侧）；
-3. **反过来腾内存**：停掉常驻服务侧 `--stop-daemon`。
+2. **卡住**：`Stop-Process -Id <论文检索侧的 PID>`（只杀那一个，别动知识库侧）；
+3. **反过来腾内存**：停掉知识库侧 `--stop-daemon`。
 
 **为什么不能按查询顺序切片**（v1.7.3 的实测教训）：若改成"查询 1 的全部 → 查询 2 的全部 → …"
 再取前 200，**查询 3~6 的结果会全部被丢弃**，连它们各自排第 1 的论文都进不了表。
 候选池建到 600 也白建。BGE 全局排序从根上避免了这个问题。
 
 **成本预期**：BGE 首次加载 **约 100 秒**（CPU，`bge-base`）；
-之后对几百条标题编码 + 排序只需**零点几秒**。那个常驻服务里的模型在它自己的进程内，
+之后对几百条标题编码 + 排序只需**零点几秒**。知识库那个常驻服务里的模型在它自己的进程内，
 **跨进程用不了**，所以每次新开进程都要重付这 100 秒。
 
 **表结构**：标准列在前（序号/PaperID/DOI/标题/中文标题/作者/年份/期刊/分区/引用数/BGE分数/
 是否期刊/是否会议/是否预印本/PDF链接/摘要/中文摘要/选中），来源特有的字段自动追加在后
-（如阶段 A 的闸门命中轴 `ax_1` / `ax_2`）。已启用首行冻结与自动筛选。
+（如 stageA 的 `ax_fiber` / `ax_build` / `ax_method`）。已启用首行冻结与自动筛选。
 最后一列「选中」留给用户在 Excel 里打勾，再用 `--selected` 取回。
 
 **三条硬约束（均为实测踩坑所得，不得回退）**：
@@ -673,6 +675,61 @@ python search_pipeline.py --out <目录> --target 200 --no-bge "q1" "q2" "q3"   
 （实测阶段 B 之前 `分区` 为 0/565），据此判断某个筛选条件是否根本不可用。
 
 ---
+
+### 3.7 摘要补全（`abstract_fill.py`，v2.0 新增）
+
+**问题**：S2 检索响应自带摘要，但覆盖率约 **84%**；缺的几乎全是 Elsevier——它自 2019 年起
+不向 Crossref / OpenAlex / S2 等第三方平台提供摘要。实测 65 篇调研缺 13 篇 = Elsevier 10、
+IEEE 1、T&F 1、Springer 1。
+
+**降级顺序（每档都实测过）**
+
+| 顺序 | 源 | 对 Elsevier | 备注 |
+|---|---|---|---|
+| 1 | Crossref | ❌ 0 篇 | 不上传摘要 |
+| 2 | OpenAlex | ❌ 0 篇 | 200 但 `abstract_inverted_index` 为空；有值时按位置还原 |
+| 3 | **Elsevier API** | ✅ 9/10 | 唯一能拿 Elsevier 摘要的通道 |
+| 4 | PubMed（按 DOI 反查 PMID） | — | IEEE 等被 PubMed 收录的刊物常有完整摘要 |
+| 5 | searchts 渲染 DOI 落地页 | ❌ | Springer / T&F 实测有效（T&F 能绕 Cloudflare）；ScienceDirect 403 |
+
+**Elsevier 通道的三个要点**
+
+1. 端点 `api.elsevier.com/content/abstract/doi/{DOI}`，取
+   `abstracts-retrieval-response.coredata."dc:description"`。
+2. **无权限时仍返回 HTTP 200**，只是没有 `dc:description`（只剩 9 个标识符字段）。
+   判据必须是"有没有这个字段"，**不能看状态码**；否则会把"校外无权限"误记成"这篇没摘要"。
+3. **授权按机构 IP，不按 key**（官方：API key identifies the calling application but does not
+   grant data or content access）。同一 key 换到境外代理即失效（实测：校内 24 个字段含摘要，
+   境外代理 22 个字段无摘要）。
+
+**key 从哪来**：<https://dev.elsevier.com> → Create API Key（勾 API Service Agreement；
+要全文/TDM 再勾 TDM Provisions）。需机构订阅 ScienceDirect 或 Scopus，且调用时出口 IP 属该机构。
+**存放**：`~/.dsh/env.json` 的 `env.ELS_API_KEY`（与其它 key 统一），代码只从环境变量或该文件读，
+**不得写进代码或 skill 目录**。
+
+**用法**：`python abstract_fill.py 论文元数据.xlsx [--limit N] [--refresh] [--quiet]`，
+回填「摘要」列并写「摘要来源」；逐篇打印各源失败原因。实测把覆盖率从 80% 提到 **98%**。
+
+### 3.8 会议论文集识别（`venue_rules.py`，v2.0 新增）
+
+**为什么需要**：S2 的 `publicationTypes` 挡不住会议论文集。实测 553 篇里标 `Conference` 的
+仅 27 篇，**另有 99 篇刊名明显是会议论文集**却标 `JournalArticle`：
+
+```
+e-Journal of Nondestructive Testing            47 篇
+Italian National Conference on Sensors         16 篇
+Journal of Physics: Conference Series           8 篇
+E3S Web of Conferences                          3 篇
+INTER-NOISE / NOISE-CON                         2 篇
+BigData Congress                                3 篇
+```
+
+**规则**：`CONF_VENUE_PATTERN` 命中即判会议；`KEEP_VENUE_PATTERN` 白名单优先放行
+（`Proceedings of the Institution of Mechanical Engineers`、`... of Civil Engineers` 是**正规期刊**，
+看到 proceedings 就排除会误杀）。
+
+**接入点**：落盘时写「疑似会议」列；`filter_papers(paper_type="journal_only")` 已把
+`is_conference_venue(venue)` 并入判据。
 
 ## 4. 注意点
 
@@ -809,49 +866,58 @@ python search_pipeline.py --out <目录> --target 200 --no-bge "q1" "q2" "q3"   
   "三次快试失败即暂停并询问用户"的实测依据；
 - 推论：重试必须有硬性次数上限，失败如实上报，绝不"再等等看"。
 
-### 4.5 分区数据的固有缺陷
+### 4.5 分区：只做中科院《新锐期刊分区表》
 
-分区来自 journalmetrics.org，收录不全。`filter_papers()` 会**放行**分区未知的论文，
-若用户要求"只要 Q1/Q2"，必须自行改为**严格过滤**：
+**为什么不做 JCR**：JCR（Clarivate，基于 JIF 的四分位）**没有可用的免费数据源**——
+需要 Web of Science / JCR 订阅，Clarivate API 需付费，LetPub 检索页也只给 IF、CiteScore、
+中科院区，**不显示 JCR 四分位**。第三方站点（journalmetrics.org 等）给出的是它们**自算**
+的四分位（OpenAlex 口径），既不是 JCR 也不是 Scopus 官方 CiteScore 四分位，拿它当 JCR
+汇报会出错。**故 v2.0 删除 journalmetrics 分支，只保留中科院新锐分区（1–4 区）。**
 
-```python
-q12 = [p for p in papers if p.quartile in ("Q1", "Q2")]   # 丢弃 Q3/Q4/unknown
-```
+| 项 | 做法 |
+|---|---|
+| 入口 | `journal_quartile.letpub_zone(issn=..., name=...)` → `("1"~"4"|None, 命中刊名, 来源说明)` |
+| 批量 | `letpub_zone_many([(issn, name), ...])`，**必须串行**（并发 >4 会被 LetPub 限流返空） |
+| 回填 | `paper_table.py --enrich-zone`，写「中科院分区」列，值 `1区`~`4区` / `未收录` |
+| 筛选 | `paper_table.py --filter --zone 1,2`；传 `Q1/Q2` 会**显式报错**（见下） |
+| 缓存 | `.letpub_zone_cache.json`，版本 2（带 `ts`） |
 
-并主动说明：被丢弃的 "unknown" 里可能包含本属 Q1/Q2 的期刊（例如某些未被分区库收录的期刊）。
+**查询顺序**：① `searchissn=`（**精确匹配 ISSN 单元格**，有 ISSN 一律用这条）
+② `searchname=`（刊名模糊匹配，缩写会漏，如 `Comput. Aided Civ. Infrastructure Eng.`）。
 
-#### 4.5.1 ⚠️ v2.0 之前的分区缓存与查询结果**不可信**（2026-09-13 实测）
+**ISSN 从哪来**：元数据表没有 ISSN 列（Semantic Scholar 不返回）。`--enrich-zone` 会按刊名
+去重、每刊取一个 DOI，用 **Crossref 反查 ISSN**，结果缓存到 `.issn_cache.json`。实测
+82 篇 → 81 本刊 → 81 次请求（首次约 1 分钟），之后零成本。
 
-`journal_quartile.py` 在 v2.0 做了两处修改，**都影响历史数据的可信度**：
+**抓取方式**：两条路径都走 `searchts read`；`requests` 直连会被 LetPub 挡回约 639 字节壳页。
 
-| 变更 | 旧实现 | 新实现（v2.0） |
+**⚠️ 耗时与提速（2026-10-30 实测）**
+
+| 路径 | 单本耗时 | 成功率 |
 |---|---|---|
-| 抓取方式 | `searchts get`（**下载**，会在磁盘落文件，违反"下载须先经用户同意"的规则） | **`searchts read`**（只读、不落盘、无需授权） |
-| 解析方式 | 网页 `<title>` 标签正则 | 解析返回 markdown 里的 **`\| Category \| Quartile \|` 表格**（取最好一档），回退到 `Subfield Quartile` |
+| 默认三级升级链（curl_cffi → Jina relay → stealth 浏览器） | **7.0~9.3 s** | — |
+| **强制 `--backend curl_cffi`** | **2.6~3.6 s** | **6/6**（返回数据还更全：15 KB vs 13 KB） |
 
-**实测证据（新旧结果直接冲突）**：
+`fetch_letpub_page()` 现在先试 curl_cffi，返回 < 2000 字符（空壳页约 1.2 KB，正常页 13~15 KB）
+才退回默认链。215 本刊从约 29 分钟降到约 10 分钟；81 本约 3.8 分钟。
 
-```
-某期刊     旧缓存 = Q2    新解析 = Q1   ← 实时页面两个类别都是 Q1
-```
+**⚠️ 缓存毒化（真实踩坑，必须保留修复）**：LetPub 单次查询会**偶发返回空页**
+（实测 CBM 一次通一次空、MSSP 连续两次空、IEEE TUFFC 空）。旧实现把 `None` 永久写进缓存，
+导致 Materials、Applied Sciences、IEEE TIM、MSSP、IEEE TUFFC 全被判「未收录」——
+215 本刊里 185 本中计。现在：未收录项 **30 天 TTL 后自动重查**，`--refresh` 无条件重查。
 
-因此：
+**分区覆盖率现实（汇报时必须说明）**：中科院分区只覆盖约 30% 的期刊（实测 215 本里 65 本能查到），
+其余是会议论文集、区域性期刊与新刊。按篇数算，1/2 区通常只占非会议文献的 **15~20%**
+（实测 480 篇 → 82 篇）。**这不是检索不力**，要提前跟用户讲清。
 
-- **缓存版本号已升到 v2**（`CACHE_VERSION = 2`）。**v1 的纯字符串缓存一律视为失效**，
-  查到旧值会重新抓取，不会再把错误值当有效缓存用。
-- **过去用旧实现做过分区筛选的调研结果，其 Q1/Q2 判定可能不准**，
-  必要时用 `--enrich-quartile --refresh` 重查。
-- 另外旧实现的另一个副作用是会在**技能目录留下下载下来的 HTML 残留**，现已消除。
-
-**首次批量查询的耗时要有预期**：每种期刊一次 `searchts read`，实测约 6~8 秒。
-200 篇文献若涉及 100 种期刊，首次约需 **10~15 分钟**；之后走缓存，几乎瞬时。
-驱动脚本应先跑一次把缓存热起来，再落盘出表。
+**破坏性变更**：`quartile_filter` 取值从 `Q1/Q2` 改为 `"1"/"2"`；`--quartile` 改为 `--zone`。
+传旧值一律**报错并提示**，绝不静默返回空表（静默空表会被误读成"该领域没论文"）。
 
 ### 4.6 检索质量
 
-宽泛关键词（如只用一个泛用方法词、或只用一个泛用对象词）会引入大量跨领域噪声（别的学科的同名术语、同一技术在其他场景下的应用等）。建议：
+宽泛关键词（如单独用 `ground penetrating radar`、`thermal insulation`）会引入大量跨领域噪声（考古地球物理、电力绝缘子、保温材料回收等）。建议：
 
-- 查询词锚定应用场景（用「对象 + 方法」两三个词把语境钉住）；
+- 查询词锚定应用场景（`building facade insulation`、`ETICS`、`building envelope`）；
 - 对标题做关键词相关性打分，排序后再呈现，并说明已人工去噪。
 
 ---
@@ -867,7 +933,7 @@ q12 = [p for p in papers if p.quartile in ("Q1", "Q2")]   # 丢弃 Q3/Q4/unknown
 | **完全没有检索到文献** | 必须区分两种性质：① **确实未命中**：查询正常完成、API 返回 0 条 → 说明所用关键词与筛选条件，并明确"这不等于该领域空白"；② **检索失败/未完成**：429、密钥不可用、网络/代理异常 → 明确"**无法据此判断该领域是否存在文献**" |
 | **只检索到部分文献** | 说明哪些查询 `failed`（失败）、哪些 `capped`（达到抓取上限，可能仍有更多未取回），以及范围被哪些条件收窄（年份、分区、文献类型） |
 | **中途换过数据源** | **换源必须先经用户同意**；说明何时、为何换源（如 S2 → Crossref），以及口径差异。使用 Crossref 时**必须明确告知：它只能检索到有 DOI 的文献**、摘要覆盖率约 28%、且只返回相关性前 N 条 |
-| **分区数据缺失** | 说明多少条因分区未收录而被排除，可能漏掉本属 Q1/Q2 的期刊 |
+| **分区数据缺失** | 说明多少条因分区未收录而被排除，可能漏掉本属 1/2 区的期刊 |
 | **翻译失败或被跳过** | 说明是保留英文原文，而不是"没有中文标题" |
 | **Phase 2 取回不齐** | 说明"取回 X/Y 篇"及未取回的 paper_id |
 | **人工去噪/人工筛选** | 说明剔除标准与数量，避免用户误以为那是全部命中 |
@@ -935,14 +1001,14 @@ Semantic Scholar 失败时，**不得自行改用 Crossref 或其他源**。必�
 | 脚本十几分钟不结束 | 自定义脚本用了过长退避且未上报 | 删除自定义长退避，改用 skill 内置 `RETRY_WAITS_S`（10/10，共 3 次请求，累计约 20 秒） |
 | 结果大量 off-topic | 查询词过宽 | 缩窄查询词，加相关性打分与人工筛选 |
 | 分区大量 unknown | 期刊未被分区库收录 | 属预期；说明局限，必要时人工补录 |
-| 保存目录不符预期 | 默认落在 `./litsearch_output` | 设 `LITSEARCH_OUT_DIR`，或按第 6 节规范传 `save_dir` |
+| 保存目录不符预期 | 默认落在 `F:\Agent\DeepseekHarness\Interaction` | 设 `LITSEARCH_OUT_DIR`，或按第 6 节规范传 `save_dir` |
 | 翻译未生效但结果正常 | 缺 `ANTHROPIC_AUTH_TOKEN` | 属预期的降级行为，保留英文即可 |
 | 技能目录出现多余 HTML 文件 | `journal_quartile.py` 调 `searchts get` 的残留 | 定期清理；分区查询完毕检查当前工作目录 |
 | 目标 docx 无法覆盖保存 | 文件被 WPS/Word 占用 | 另存新文件，或请用户关闭文档 |
 
-### 6.1 故障复盘：2026-09 一次调研卡死
+### 6.1 故障复盘：2026-09 脱粘界面调研卡死
 
-**经过**：检索某主题时，S2 全程 429；随后改用 OpenAlex（已转付费，返回 `Insufficient budget`），再用 Crossref 成功。
+**经过**：检索"脱粘界面非线性振动"时，S2 全程 429；随后改用 OpenAlex（已转付费，返回 `Insufficient budget`），再用 Crossref 成功。
 
 **根因**：
 1. 数据源限流（S2 间歇性 429）；
@@ -988,6 +1054,10 @@ Semantic Scholar 失败时，**不得自行改用 Crossref 或其他源**。必�
 
 **代码无需改动**：`semantic_scholar_search.py` 一直传纯关键词串、从未用 `total` 做汇报，用法本就合规。
 
+> ⚠️ **以下 v1.x 记录里的 `--enrich-quartile` / `--quartile` / `Q1` 属历史口径**：
+> v2.0 起已分别改为 `--enrich-zone` / `--zone` / `1`~`4` 区，直接照抄旧命令会报错。
+> 保留原文只为留存当时的实测证据，**不要当作现行用法**。
+
 **已落实的修正（v1.7.0，2026-09-13，按用户确认的流程）**：
 
 用户确认了标准流程：**按主题检索 → 不设分区要求 → 排除会议与预印本 → 取前 200 篇
@@ -997,9 +1067,9 @@ Semantic Scholar 失败时，**不得自行改用 Crossref 或其他源**。必�
    违反"下载须先经用户同意"的规则，也是技能目录 HTML 残留的根源）；
 2. **分区解析改为读 `| Category | Quartile |` markdown 表格**（旧版靠 `<title>` 正则，页面改版后不可靠），
    回退到 `Subfield Quartile`；
-3. **新增缓存版本号**（`CACHE_VERSION = 2`）：实测旧缓存把某期刊记成 Q2、
+3. **新增缓存版本号**（`CACHE_VERSION = 2`）：实测旧缓存把 `Buildings` 记成 Q2、
    而实时页面是 Q1，**v1 旧缓存一律作废**；历史分区筛选结果可能不准；
-4. **新增 `paper_table.py --enrich-quartile`**：查分区并回填到已有 Excel 的「分区」列
+4. **新增 `paper_table.py --enrich-quartile`**（v2.0 起改名 `--enrich-zone`）：查中科院分区并回填
    （`--refresh` 可全部重查）；
 5. **统一"默认 200 篇"**：新增 `DEFAULT_TOTAL_LIMIT = 200`，
    `search_paginated()` 默认值由 400 改为 200（语义是"总共取前 200"）；
@@ -1010,8 +1080,9 @@ Semantic Scholar 失败时，**不得自行改用 Crossref 或其他源**。必�
    另外 `ApiUnavailableError` 的提问顺序改为**首选"等待恢复"、Crossref 退为最后手段**。
 
 **实测验证（端到端）**：6 篇测试样本完整走通
-落盘 → `--stats`（分区 0/6）→ `--enrich-quartile`（期刊A Q1 / 期刊B Q1 /
-期刊C Q1 / 期刊D Q2 / 期刊E unknown / 期刊F unknown）→ `--stats`（Q1=3 Q2=1 unknown=2）→
+落盘 → `--stats`（分区 0/6）→ `--enrich-quartile`（Buildings Q1 / Sensors Q1 /
+Journal of Building Engineering Q1 / Optical Fiber Technology Q2 / Applied Sciences unknown /
+Structural Health Monitoring unknown）→ `--stats`（Q1=3 Q2=1 unknown=2）→
 `--filter --quartile Q1` 正确返回 3 条。4 个既有测试套件仍全部通过；
 `filter_papers` 行为单测确认：无 `publicationTypes` 的论文被保留、会议与预印本被排除、
 不传 `quartile_filter` 时不按分区筛。
@@ -1079,8 +1150,8 @@ v1.7.0 把 `search_paginated()` 的默认值由 400 改成 200，但那个参数
 用户明确了标准方案：**设 3 组关键词，每组取「目标篇数」那么多（200 目标 → 每组 2 页 = 200 篇，
 3 组 → 候选池最多 600）；然后用 BGE 对每组各自评分，合并后按分全局排序取前 200。**
 
-1. **`relevance_scorer.py` 模型由 `bge-small-*` 换成 `bge-base-*`**，与本机另一套 BGE 服务
-   **统一**。
+1. **`relevance_scorer.py` 模型由 `bge-small-*` 换成 `bge-base-*`**，与结构化知识库
+   （`Agent-Structured-KB` 的 `db.py` / `tools/reranker.py`）**统一**。
    两个模型本机 `~/.cache/huggingface/hub/` 已有缓存（418.7 MB / 780.9 MB），无需下载。
 2. **单篇得分由「各关键词相似度之和」改为「平均」**。组内排序等价，
    但**跨组比较必须用平均** —— 否则关键词多的那组得分天然偏高、合并排序时整体占优。
@@ -1101,7 +1172,7 @@ v1.7.0 把 `search_paginated()` 的默认值由 400 改成 200，但那个参数
 | 多组命中的取分 | 取较高分（第1组 0.5920 / 第3组 0.5963 → 保留 **0.5963**） |
 | 全局降序 / 取前 N / 不足上限 / 空输入 | 全部正确 |
 
-⚠️ **注意**：常驻 BGE 服务（端口 8767）里已加载的 BGE 在**它自己的进程**内，
+⚠️ **注意**：知识库常驻服务（端口 8767）里已加载的 BGE 在**它自己的进程**内，
 **跨进程无法共享**，所以论文检索每次新开进程都要重付约 100 秒加载时间。
 
 `interleave_by_query()`（v1.7.3 的轮转融合）**保留为 BGE 不可用时的降级路径**，
@@ -1109,7 +1180,7 @@ v1.7.0 把 `search_paginated()` 的默认值由 400 改成 200，但那个参数
 
 **v1.9.0（同日，语言分支与内存生命周期）**：
 
-用户指出：论文检索用**英文**分支，而常驻 BGE 服务用的是**中文**分支
+用户指出：论文检索用**英文**分支，而知识库常驻服务用的是**中文**分支
 （该库 `.lklang` = `zh`，实测常驻进程占 829 MB），要求"检索期间持续激活英文分支、
 检索完成关闭，不占运行内存"。据此做了三处改动：
 
@@ -1156,14 +1227,14 @@ v1.7.0 把 `search_paginated()` 的默认值由 400 改成 200，但那个参数
 
 ## 7. 文件管理
 
-### 7.1 调研归档建议（可选）
+### 7.1 学术调研归档规范（本环境约定）
 
 ```
-<调研根目录>\
+F:\Agent\DeepseekHarness\AcademicResearch\
 ├── 说明文件.md                     # 归档规则说明
 ├── 调研日志.md                     # 每次调研追加一条记录
 └── 记录\
-    └── <YYYYMMDD>_<主题>\          # 例：20260910_示例主题
+    └── <YYYYMMDD>_<主题>\          # 例：20260910_脱粘界面非线性振动
         ├── <脚本>.py               # 检索/处理脚本
         ├── ..._all.json            # 全量结果
         ├── ..._relevant.txt        # 相关结果
@@ -1174,11 +1245,11 @@ v1.7.0 把 `search_paginated()` 的默认值由 400 改成 200，但那个参数
 
 ### 7.2 执行要求
 
-1. **每次调研开始**先建目录：`<调研根目录>\记录\<YYYYMMDD>_<主题>\`（日期取当天）。
-2. **所有中间与最终数据**写入该目录；**不要**使用 skill 默认输出目录。
+1. **每次调研开始**先建目录：`AcademicResearch\记录\<YYYYMMDD>_<主题>\`（日期取当天）。
+2. **所有中间与最终数据**写入该目录；**不要**使用 skill 默认的 `Interaction` 目录。
    - 编程时给 `save_filtered_results(..., save_dir=OUT)`；
    - 或设置环境变量 `LITSEARCH_OUT_DIR=<OUT>`。
-3. **调研结束**在 `<调研根目录>\调研日志.md` 追加一条记录，格式：
+3. **调研结束**在 `AcademicResearch\调研日志.md` 追加一条记录，格式：
 
 ```
 ### YYYY-MM-DD | 主题
@@ -1191,3 +1262,23 @@ v1.7.0 把 `search_paginated()` 的默认值由 400 改成 200，但那个参数
 
 4. **交付物**（Word/报告等）按用户要求放置（桌面、交互文件夹等），但其**生成脚本与源数据仍归档**到对应 `记录\日期_主题\`。
 5. **异常必须留痕且必须汇报**：发生 `ApiUnavailableError`、换源、分区缺失、翻译跳过、结果被截断等情况，一律写入 `检索完整性报告`、调研日志与交付说明，并在给用户的汇报中明确列出，避免后续把"取数失败/部分取回"误读为"无相关文献"。
+
+**v2.0.0（2026-10-30，按用户决策重做分区与数据源）**：
+
+1. **入表上限 200 → 不限**（`DEFAULT_TOTAL_LIMIT = None`，2026-10-30 用户定 A 方案）。理由：请求量已由 `DEFAULT_PER_ROUND` 唯一决定，再拍一个表上限只会白丢候选；要小表用 `--top N`。原 200 的问题：要按分区/年份再筛时，BGE 前 200 名
+   常漏掉整本一区刊（实测 200 篇表里没有 NDT&E International、Automation in Construction），
+   放大到闸门后全量（553 篇）才筛得出完整结果。
+2. **每轮取回 200 → 500**（`DEFAULT_PER_ROUND`，= 5 页）。⚠️ 单页仍是 100，所以
+   **每轮 500 篇 = 5 次请求**；4 轮 = 20 次请求，比默认 200 时的 8 次多一倍多，429 概率随之上升。
+3. **分区只保留中科院新锐分区**，删除 journalmetrics 分支（约 100 行）与 `.quartile_cache.json`。
+   `--enrich-quartile` / `--quartile` 废弃并报错，改用 `--enrich-zone` / `--zone 1,2`；
+   `quartile_filter` 取值从 `Q1/Q2` 改为 `"1"/"2"`。
+4. **分区查询提速**：优先 `searchts read --backend curl_cffi`（7~9 s → 2.6~3.6 s，6/6 成功）。
+5. **分区缓存加 TTL**：未收录项 30 天后重查，修掉"偶发空页被永久缓存成未收录"的毒化。
+6. **新增 `venue_rules.py`**：按刊名识别会议论文集（实测漏判 99 篇）。
+7. **新增 `abstract_fill.py`**：Crossref → OpenAlex → Elsevier → PubMed → searchts 渲染，
+   把摘要覆盖率从 80% 提到 98%；数据源明确为三层（S2 主源 / Crossref 备用 / Elsevier 仅自家论文）。
+8. 环境坑记录：PowerShell 重定向中文输出被判 binary（需 `PYTHONIOENCODING=utf-8`）；
+   `Start-Process -ArgumentList` 不自动加引号；`Test-Path`/`Remove-Item` 把 `[ ]` 当通配符（用 `-LiteralPath`）。
+9. 语义澄清：`queries_capped` 是"每轮达到抓取上限"，**不等于失败**；`search_pipeline.run()`
+   不做翻译（`中文标题` 列为空，需另跑 `translator`）。

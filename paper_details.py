@@ -209,6 +209,18 @@ def save_detail_results(
 def main():
     """主流程：加载 ID → 查询详情 → 翻译摘要 → 保存"""
     args = sys.argv[1:]
+
+    # -h/--help 单独拦掉：本脚本用手工 argv 解析（要支持「标题」这种含空格的输入），
+    # 不能直接套 argparse；但 `--help` 会被当成 paper_id 去查，所以先给用法并正常退出。
+    if any(a in ("-h", "--help") for a in args):
+        print("Phase 2：按 paper_id / 标题查论文详情并翻译摘要\n")
+        print("用法：")
+        print("  python paper_details.py <paper_id 或标题> ...")
+        print("  python paper_details.py --json <file.json>")
+        print("  python paper_details.py --file <ids.txt>")
+        print("  echo 'id1 id2' | python paper_details.py --stdin")
+        sys.exit(0)
+
     paper_ids = load_paper_ids(args)
 
     if not paper_ids:

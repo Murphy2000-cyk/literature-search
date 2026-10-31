@@ -58,11 +58,10 @@ def _load_env_from_dsh_env() -> None:
 
 _load_env_from_dsh_env()
 
-# 输出目录：可用环境变量 LITSEARCH_OUT_DIR 覆盖；
-# 默认落在当前工作目录下的 litsearch_output（自动创建）
+# 输出目录：可用环境变量 LITSEARCH_OUT_DIR 覆盖；默认 F:\Agent\DeepseekHarness\Interaction（自动创建）
 DEFAULT_SAVE_DIR = os.getenv(
     "LITSEARCH_OUT_DIR",
-    os.path.join(os.getcwd(), "litsearch_output")
+    r"F:\Agent\DeepseekHarness\Interaction"
 )
 
 
@@ -136,11 +135,14 @@ RELEVANCE_MAX_RESULTS = 1000
 # 单次 API 请求最多 100 条（平台限制）；这也是"每个查询取多少"的默认值。
 DEFAULT_PER_QUERY_LIMIT = 100
 
-# **写入元数据表的篇数上限（用户可自行定义，默认 200）**。
-# 语义是**所有查询合并去重之后取前 N 篇**，不足 N 篇则有多少存多少（不补齐、不报错）。
-# 注意与 DEFAULT_PER_QUERY_LIMIT 的区别：
-#   每个查询取 100 条 ×6 个查询 = 最多 600 条候选 → 合并去重 → 取前 200 条入表。
-DEFAULT_TOTAL_LIMIT = 200
+# **写入元数据表的篇数上限。默认 None = 不截断**（闸门后有多少写多少）。
+#
+# 为什么改成"不截断"（2026-10-30 用户定）：
+#   检索量已由 DEFAULT_PER_ROUND 唯一决定，表和它不一致就会出现"查 2000 只留 600"的
+#   无谓损耗——被截掉的可能正是要按分区/年份再筛的一区刊（实测 BGE 前 200 名常整本漏掉）。
+#   想要更小的表，用 `--top N` 显式压小，那是落盘时的选择，不是默认行为。
+#   save_papers_xlsx / search_pipeline 均已支持 None = 不截断（0 同义）。
+DEFAULT_TOTAL_LIMIT = None
 
 # ---------------------------------------------------------------- 检索请求字段
 # **把 DOI / 摘要 / OA 链接直接放进【检索】请求的 fields。**
@@ -150,7 +152,8 @@ DEFAULT_TOTAL_LIMIT = 200
 # 没有 externalIds（DOI 在里面）也没有 abstract，
 # 于是"要交付的 N 篇"必须再逐篇调一次 /paper/{id} 补详情 —— 10 篇就是 10 次以上调用。
 #
-# 实测（1 次请求，limit=100）：加上这三个字段后**同一次请求**即可带回
+# 实测（1 次请求，limit=100，查询 "external thermal insulation composite system
+# non-destructive testing"）：加上这三个字段后**同一次请求**即可带回
 #     DOI 88/100 (88%) · 摘要 74/100 (74%) · OA PDF 60/100 (60%)
 # 响应体积 214 KB，**调用次数 +0**。
 #
@@ -174,8 +177,10 @@ MAX_KEYWORDS = 5
 ROUNDS_MIN = 3
 ROUNDS_MAX = 4
 
-# 每轮默认取回篇数（用户指定 200 = 2 页，每页 100 是平台硬上限）
-DEFAULT_PER_ROUND = 200
+# 每轮默认取回篇数（用户 2026-10-30 指定：500 = **5 页**，每页 100 是平台硬上限）。
+# 一次"取 500 篇"在接口层是 **5 次请求**（offset 0/100/200/300/400），不是 1 次。
+# 请求总量 = ceil(每轮篇数/100) × 轮数；4 轮 500 篇 = 20 次请求。
+DEFAULT_PER_ROUND = 500
 
 
 def check_keyword_count(query: str, max_keywords: int = MAX_KEYWORDS,
@@ -216,9 +221,10 @@ def check_rounds(queries, strict: bool = True) -> str:
     """校验检索轮数是否落在标准区间 3~4 轮内。"""
     n = len(queries or [])
     if n < ROUNDS_MIN or n > ROUNDS_MAX:
+        pages = max(1, -(-DEFAULT_PER_ROUND // DEFAULT_PER_QUERY_LIMIT))
         msg = (f"标准检索为 {ROUNDS_MIN}~{ROUNDS_MAX} 轮，当前 {n} 轮。\n"
                f"  每轮是一条 **≤{MAX_KEYWORDS} 词**的关键词微调变体，"
-               f"每轮取 {DEFAULT_PER_ROUND} 篇（2 页）。")
+               f"每轮取 {DEFAULT_PER_ROUND} 篇（{pages} 页）。")
         if strict:
             raise ValueError(msg)
         return f"轮数偏离标准（{n} 轮，未拦截）"
@@ -437,7 +443,7 @@ class SemanticScholarSearcher:
         自动分页检索，最多获取**该查询**的 total_limit 篇（默认 100 = 一页）。
 
         注意：total_limit 是**单个查询**的上限，不是所有查询的总数。
-        「总共入表多少篇」由 DEFAULT_TOTAL_LIMIT（默认 200）控制，在合并去重之后截断，
+        「总共入表多少篇」由 DEFAULT_TOTAL_LIMIT 控制，**默认 None = 不截断**，
         见 paper_table.save_papers_xlsx() 的 total_limit 参数。
 
         Semantic Scholar API 单页最多返回 100 篇，通过 offset 翻页。
@@ -830,38 +836,34 @@ class SemanticScholarSearcher:
         return {"total_requests": self.request_count}
 
 
-def enrich_quartiles(papers: List[PaperInfo]) -> List[PaperInfo]:
-    """
-    为论文列表查询 JCR 分区。
+def enrich_quartiles(papers: List[PaperInfo], refresh: bool = False) -> List[PaperInfo]:
+    """按中科院《新锐期刊分区表》回填 paper.quartile（值为 "1"~"4" 或 ""）。
+
+    为什么不是 JCR：JCR（Clarivate，基于 JIF）没有免费数据源——需 Web of Science /
+    JCR 订阅，Clarivate API 付费，LetPub 检索页也不显示 JCR 四分位。第三方自算的四分位
+    不能当 JCR 用。详见 journal_quartile 模块文档。
 
     流程：
-    1. 收集所有唯一期刊名（venue）
-    2. 调用 journal_quartile.lookup() 查询分区
-    3. 将结果赋值到 paper.quartile
-
-    缓存机制：已查过的期刊从缓存读取，不重复请求。
+    1. 按刊名去重，每本刊取一个 DOI
+    2. 无 ISSN 的 → Crossref 按 DOI 反查 ISSN（缓存 .issn_cache.json）
+    3. letpub_zone(issn=...) 优先，缺 ISSN 才退回刊名
+    4. 写回 paper.quartile
     """
-    from journal_quartile import lookup as quartile_lookup
+    from journal_quartile import zone_map_for_journals
 
-    venues = set()
+    venue_doi = {}
     for p in papers:
-        v = p.venue.strip()
-        if v:
-            venues.add(v)
+        v = (p.venue or "").strip()
+        if v and v not in venue_doi:
+            venue_doi[v] = (p.doi or "")
 
-    print(f"\n[QUARTILE] Looking up {len(venues)} unique journals...")
-    venue_map = {}
-    checked = 0
-    for venue in sorted(venues):
-        checked += 1
-        q = quartile_lookup(venue)
-        venue_map[venue] = q
-        safe_venue = venue.encode('ascii', 'replace').decode('ascii') if venue else ""
-        status = q or "unknown"
-        print(f"  [{checked}/{len(venues)}] {safe_venue} -> {status}")
+    print(f"\n[ZONE] Looking up {len(venue_doi)} unique journals (中科院新锐分区)...")
+    # 与 paper_table.enrich_zone_column 走**同一个**入口（ISSN 优先 + 刊名兜底），
+    # 避免两条路径口径不一致。
+    zone_map = zone_map_for_journals(venue_doi, refresh=refresh, verbose=True)
 
     for p in papers:
-        p.quartile = venue_map.get(p.venue.strip(), "") or ""
+        p.quartile = zone_map.get((p.venue or "").strip()) or ""
 
     return papers
 
@@ -882,6 +884,15 @@ DEFAULT_PUBLICATION_TYPES = ["JournalArticle", "Review"]
 # 与用户「检索时不设分区要求」的要求冲突。
 # 现在改为 None：**要按分区筛必须显式传 quartile_filter**。
 DEFAULT_QUARTILE_FILTER = None
+
+
+def _is_conference_venue(venue: str) -> bool:
+    """刊名是否属会议论文集（规则见 venue_rules.py）。模块缺失时退化为 False。"""
+    try:
+        from venue_rules import is_conference_venue
+        return is_conference_venue(venue or "")
+    except Exception:
+        return False
 
 
 def filter_papers(
@@ -919,12 +930,23 @@ def filter_papers(
         # journal_only 的语义 = **非会议 + 非预印本**。
         # 这里**不再**要求 is_journal=True —— 那会把「S2 没返回 publicationTypes」的
         # 正常期刊论文一并丢掉，属静默漏检。
-        if paper_type == "journal_only" and (paper.is_conference or paper.is_preprint):
+        # 另外补一条 venue 判据：S2 会把 NDT.net / JPCS / E3S 这类会议论文集
+        # 标成 JournalArticle，光看 publicationTypes 挡不住（实测 553 篇里漏 99 篇）。
+        if paper_type == "journal_only" and (
+                paper.is_conference or paper.is_preprint
+                or _is_conference_venue(paper.venue)):
             continue
         if paper_type == "conference_only" and not paper.is_conference:
             continue
-        if quartile_filter and paper.quartile and paper.quartile not in quartile_filter:
-            continue
+        if quartile_filter:
+            # 分区取值已改为中科院 1~4 区；传 Q1/Q2 属旧 JCR 口径，必须显式拦下，
+            # 否则会静默筛成空表（"看起来该领域没论文"）。
+            if any(str(x).upper().startswith("Q") for x in quartile_filter):
+                raise ValueError(
+                    "quartile_filter 取值已改为中科院分区 1~4（如 ['1','2']）；"
+                    "Q1/Q2 属 JCR 口径，本 skill 不再提供 JCR 四分位（无免费数据源）。")
+            if paper.quartile and paper.quartile not in quartile_filter:
+                continue
         filtered.append(paper)
     return filtered
 

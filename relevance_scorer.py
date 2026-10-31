@@ -6,11 +6,12 @@ BGE 多关键词标题相关性排序模块 v2.0
 
 v2.0 的两处关键变更
 -------------------
-1. **模型由 bge-small 换成 bge-base**，与本机另一套 BGE 服务**使用同一套模型**：
+1. **模型由 bge-small 换成 bge-base**，与结构化知识库（`Agent-Structured-KB`
+   的 `db.py` / `tools/reranker.py`）**使用同一套模型**：
        - `BAAI/bge-base-en-v1.5`（英文）
        - `BAAI/bge-base-zh-v1.5`（中文）
    两个模型在本机 `~/.cache/huggingface/hub/` 已有缓存，**不需要重新下载**。
-   （旧版用 bge-small，与该常驻服务不一致。）
+   （旧版用 bge-small，与知识库不一致。）
 
 2. **单篇得分由「各关键词相似度之和」改为「平均」**。
    组内排序不受影响（关键词数固定时求和与求平均单调等价），
@@ -28,7 +29,7 @@ v2.0 的两处关键变更
 
 生命周期（重要）
 ----------------
-论文检索只用**英文分支**；常驻 BGE 服务用的是**中文分支**
+论文检索只用**英文分支**；结构化知识库的常驻服务用的是**中文分支**
 （那个库是中文内容，`.lklang` = `zh`），两者在**不同进程**里，内存不共享。
 
 - `lang="en"`（默认）：**永远只加载英文模型**。即使查询词里混了中文也不会
@@ -123,7 +124,7 @@ STOP_WORDS = {
 class RelevanceScorer:
     """BGE 多关键词标题相关性排序器"""
 
-    # 模型名称 —— 与本机另一套 BGE 服务保持一致，本机已有缓存
+    # 模型名称 —— 与结构化知识库（Agent-Structured-KB）保持一致，本机已有缓存
     MODEL_EN = "BAAI/bge-base-en-v1.5"
     MODEL_ZH = "BAAI/bge-base-zh-v1.5"
 
@@ -218,8 +219,8 @@ class RelevanceScorer:
         将查询按空格拆分为关键词，去掉停用词。
 
         示例:
-            "large language model reasoning"
-            -> ["large", "language", "model", "reasoning"]
+            "external wall insulation non-destructive testing"
+            -> ["external", "wall", "insulation", "non", "destructive", "testing"]
 
         Args:
             query: 查询字符串
@@ -483,12 +484,12 @@ if __name__ == "__main__":
     print(f"Stop words count: {len(STOP_WORDS)}")
 
     # 测试关键词拆分
-    test_query = "large language model reasoning"
+    test_query = "external wall insulation non-destructive testing"
     keywords = RelevanceScorer.split_keywords(test_query)
     print(f"Query: {test_query}")
     print(f"Keywords: {keywords}")
 
-    test_query2 = "chain of thought prompting evaluation"
+    test_query2 = "infrared thermography building facade delamination detection"
     keywords2 = RelevanceScorer.split_keywords(test_query2)
     print(f"Query: {test_query2}")
     print(f"Keywords: {keywords2}")

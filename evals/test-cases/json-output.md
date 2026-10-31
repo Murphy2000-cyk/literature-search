@@ -2,7 +2,7 @@
 
 ## Input
 ```
-搜索 "large language model" 的论文，2020-2026年
+搜索 "infrared thermography" 的论文，2020-2026年
 ```
 
 ## Expected

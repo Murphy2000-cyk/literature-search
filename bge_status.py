@@ -7,11 +7,11 @@
 --------
 **BGE 按进程隔离，不存在"共享的一侧"。**
 
-- 常驻 BGE 服务进程：加载 **中文** 分支（`bge-base-zh-v1.5`），长期驻留
+- 知识库常驻服务进程：加载 **中文** 分支（`bge-base-zh-v1.5`），长期驻留
 - 论文检索进程：加载 **英文** 分支（`bge-base-en-v1.5`），**跑完就退出**
 
 结束论文检索进程时，那个进程的英文 BGE 与它自己那份 torch 一起消失，
-**完全不影响**常驻服务那个进程里的中文 BGE（实测：结束后常驻服务的 PID 都没变）。
+**完全不影响**知识库那个进程里的中文 BGE（实测：结束后常驻服务的 PID 都没变）。
 
 用法
 ----
@@ -20,20 +20,19 @@
 import os
 import sys
 
-
+# 依赖已装进 py313 环境，无需 sys.path.insert
 try:
     import psutil
 except ImportError:
-    print("需要 psutil：pip install psutil")
+    print("需要 psutil：& \"E:\\Anaconda3\\envs\\py313\\python.exe\" -m pip install psutil")
     sys.exit(1)
 
 # 判定关键词
-# 常驻 BGE 服务的识别特征（可用环境变量覆盖）
-KB_HINTS = tuple(h for h in os.getenv("BGE_KB_HINTS", "reranker,embedding_server").split(",") if h)
+KB_HINTS = ("reflect_searchd", "webui", "lk.py", "iterative_search", "reflect_webui")
 LIT_HINTS = ("search_pipeline", "literature-search", "relevance_scorer",
              "semantic_scholar_search", "paper_table")
 
-KB_PORTS = tuple(int(p) for p in os.getenv("BGE_KB_PORTS", "8765,8766,8767").split(",") if p)
+KB_PORTS = (8765, 8766, 8767)
 
 
 def port_owners():
@@ -72,7 +71,7 @@ def main():
 
             served = [pt for pt, opid in ports.items() if opid == pid]
             if served or any(h in low for h in KB_HINTS):
-                tag = f"常驻 BGE 服务（中文分支），端口 {served}" if served else "常驻服务相关（中文分支）"
+                tag = f"知识库常驻服务（中文分支），端口 {served}" if served else "知识库相关（中文分支）"
                 kb_rows.append((pid, rss, tag, cmd))
             elif any(h in low for h in LIT_HINTS):
                 # 光看路径不够：本工具自己、journal_quartile 等也在同一目录下。
@@ -98,7 +97,7 @@ def main():
             print(f"  PID {pid:>6}  {rss:>7.0f} MB  {tag}")
             print(f"          {cmd[:110]}")
 
-    show(kb_rows, "常驻服务侧（中文 BGE，长期驻留）")
+    show(kb_rows, "知识库侧（中文 BGE，长期驻留）")
     show(lit_rows, "论文检索侧（英文 BGE，跑完即退）")
     show(other_rows, "其他 python 进程")
 
@@ -106,7 +105,7 @@ def main():
     lit_loaded = [r for _, r, t, _ in lit_rows if "★" in t]
     total_lit = sum(lit_loaded)
     print("\n" + "-" * 76)
-    print(f"  常驻服务侧合计 : {total_kb:>7.0f} MB   （一直在，中文 BGE）")
+    print(f"  知识库侧合计 : {total_kb:>7.0f} MB   （一直在，中文 BGE）")
     if lit_loaded:
         print(f"  英文 BGE 合计: {total_lit:>7.0f} MB   "
               f"★ {len(lit_loaded)} 个进程正在加载英文 BGE；它们结束后自动全部归还")
@@ -122,10 +121,10 @@ def main():
     print("     英文 BGE 与它那份 torch 一起消失，中文侧零影响。")
     print("  2) 如果某个论文检索进程卡住了，可以只结束它：")
     print("       Stop-Process -Id <上面列出的论文检索侧 PID>")
-    print("     ⚠️ 只结束【论文检索侧】的 PID，不要动常驻服务侧的。")
-    print("  3) 反过来，如果跑论文检索时想腾内存，可以临时停掉常驻服务侧：")
-    print("       结束该常驻服务的进程（或用它自己的 --stop-daemon）")
-    print("     释放约 825 MB；下次用该服务时它会自动拉起。")
+    print("     ⚠️ 只结束【论文检索侧】的 PID，不要动知识库侧的。")
+    print("  3) 反过来，如果跑论文检索时想腾内存，可以临时停掉知识库侧：")
+    print("       python \"C:\\Users\\lenovo\\.agents\\skills\\Structured-KB-reflect\\scripts\\search_reflect.py\" --stop-daemon")
+    print("     释放约 825 MB；下次用知识库时它会自动拉起。")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 ## Input
 ```
-搜索 "chain of thought prompting" 的论文，仅期刊论文
+搜索 "non-destructive testing" 的论文，仅期刊论文
 ```
 
 ## Expected

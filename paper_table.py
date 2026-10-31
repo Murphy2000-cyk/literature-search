@@ -14,7 +14,7 @@
 按需读取（CLI，输出刻意做得很小）：
 
     python paper_table.py --xlsx 论文元数据.xlsx --stats
-    python paper_table.py --xlsx 论文元数据.xlsx --filter --year-min 2020 --quartile Q1 --limit 20
+    python paper_table.py --xlsx 论文元数据.xlsx --filter --year-min 2020 --zone 1 --limit 20
     python paper_table.py --xlsx 论文元数据.xlsx --filter --has-abstract --select 标题,DOI --limit 50
     python paper_table.py --xlsx 论文元数据.xlsx --selected              # 读用户勾选的「选中」列
 
@@ -30,14 +30,16 @@
 import os
 import sys
 import json
+import time
 import argparse
 
-# 每个表默认写入的篇数上限（**用户可自定义**，默认 200）。
+# 每个表默认写入的篇数上限（**默认 None = 不截断**，闸门后有多少写多少）。
 # 语义：所有查询合并去重之后取前 N 篇；**候选不足 N 篇时有多少存多少**，不补齐、不报错。
+# 想要更小的表用 `--top N`；传 0 与 None 同义（不限）。
 try:
     from semantic_scholar_search import DEFAULT_TOTAL_LIMIT
 except Exception:                       # 允许本模块被单独使用时的兜底
-    DEFAULT_TOTAL_LIMIT = 200
+    DEFAULT_TOTAL_LIMIT = None
 
 # ---------------------------------------------------------------- 列定义
 
@@ -51,11 +53,12 @@ PREFERRED = [
     ("作者", "authors", False),
     ("年份", "year", False),
     ("期刊", "venue", False),
-    ("分区", "quartile", False),
+    ("中科院分区", "quartile", False),
     ("引用数", "citation_count", False),
     ("BGE分数", "relevance_score", False),
     ("是否期刊", "is_journal", False),
     ("是否会议", "is_conference", False),
+    ("疑似会议", "suspected_conference", False),
     ("是否预印本", "is_preprint", False),
     ("PDF链接", "pdf_url", False),
     ("摘要", "abstract", False),
@@ -76,8 +79,8 @@ ALIASES = {
 TEXT_HEADERS = {"PaperID", "DOI"}
 COLUMN_WIDTHS = {
     "序号": 6, "PaperID": 42, "DOI": 32, "标题": 60, "中文标题": 40,
-    "作者": 28, "年份": 6, "期刊": 32, "分区": 6, "引用数": 8,
-    "BGE分数": 8, "是否期刊": 8, "是否会议": 8, "是否预印本": 10,
+    "作者": 28, "年份": 6, "期刊": 32, "中科院分区": 10, "引用数": 8,
+    "BGE分数": 8, "是否期刊": 8, "是否会议": 8, "疑似会议": 8, "是否预印本": 10,
     "PDF链接": 30, "摘要": 40, "中文摘要": 30, "选中": 6, "文献类型": 16,
 }
 
@@ -170,7 +173,7 @@ def interleave_by_query(results_by_query, total_limit=DEFAULT_TOTAL_LIMIT):
 
     Args:
         results_by_query: {查询词: [论文, ...]} 或 [[论文, ...], ...]
-        total_limit: 融合后取前多少篇（默认 DEFAULT_TOTAL_LIMIT = 200）
+        total_limit: 融合后取前多少篇（默认 None = 不截断）
 
     Returns:
         融合去重后的列表，长度不超过 total_limit
@@ -212,7 +215,7 @@ def save_papers_xlsx(papers, out_dir, prefix="论文元数据", sheet_title="论
                      total_limit=DEFAULT_TOTAL_LIMIT):
     """把论文元数据写成一个 xlsx。返回文件路径。
 
-    total_limit：**写入篇数上限**，默认 DEFAULT_TOTAL_LIMIT（200）。用户可自行定义。
+    total_limit：**写入篇数上限**，默认 DEFAULT_TOTAL_LIMIT（None = 不截断）。用户可自行定义。
         - 候选多于上限 → 取前 total_limit 篇
         - 候选少于上限 → **有多少存多少**，不补齐、不报错
         - 传 None 或 0 → 不截断，全部写入
@@ -235,6 +238,15 @@ def save_papers_xlsx(papers, out_dir, prefix="论文元数据", sheet_title="论
         print(f"[LIMIT] 未设上限，全部 {available} 篇入表")
 
     records = [_to_dict(p) for p in papers]
+    # 会议论文集识别（venue_rules）：S2 的 publicationTypes 挡不住 NDT.net / JPCS / E3S
+    # 这类"标成 JournalArticle 的会议论文集"，这里按刊名补一个「疑似会议」标记。
+    try:
+        from venue_rules import is_conference_venue
+        for r in records:
+            r["suspected_conference"] = (
+                "是" if is_conference_venue(r.get("venue") or "") else "否")
+    except Exception:
+        pass
     cols = build_columns(records)
 
     os.makedirs(out_dir, exist_ok=True)
@@ -357,7 +369,7 @@ def show_stats(path, top_venues=15):
         for b in sorted(buckets):
             out.append(f"  {b}-{b+4}: {buckets[b]}")
 
-    # 分区分布（含缺失）—— 直接对应"Q1 筛选为什么会全空"
+    # 分区分布（含缺失）—— 直接对应"按分区筛为什么会全空"
     if "分区" in headers:
         out.append("-" * 60)
         dist = {}
@@ -408,11 +420,16 @@ def apply_filters(rows, args, headers):
         conds.append((f"引用数>={args.min_citations}",
                       lambda r: (_num(r.get("引用数")) or -1) >= args.min_citations))
 
-    if args.quartile:
-        needed.append("分区")
-        want = {q.strip().upper() for q in args.quartile.split(",")}
-        conds.append((f"分区∈{sorted(want)}",
-                      lambda r: (r.get("分区") or "").strip().upper() in want))
+    if args.zone:
+        ZONE_COL = "中科院分区"
+        needed.append(ZONE_COL)
+        want = {z.strip().replace("区", "") for z in str(args.zone).split(",") if z.strip()}
+        if any(w.upper().startswith("Q") for w in want):
+            raise SystemExit(
+                "[ERROR] 分区取值已改为中科院 1~4 区（如 --zone 1,2）。"
+                "Q1/Q2 属 JCR 口径，本 skill 不再提供 JCR 四分位（无免费数据源）。")
+        conds.append((f"{ZONE_COL}∈{sorted(want)}区",
+                      lambda r: (str(r.get(ZONE_COL) or "").strip().replace("区", "")) in want))
 
     if args.title_contains:
         needed.append("标题")
@@ -570,16 +587,32 @@ def show_selected(path):
         print(m)
 
 
+# ---------------------------------------------------------------- ISSN 解析
+#
+# 实现已统一到 journal_quartile.py（那里是唯一维护点）：
+#   - resolve_issns()       刊名 → ISSN（Crossref 反查 + .issn_cache.json）
+#   - zone_map_for_journals() 刊名 → 中科院分区（ISSN 优先、刊名兜底）
+#
+# 为什么不在本模块重复实现：v3.0 之前 paper_table 与 semantic_scholar_search
+# 各有一套，前者按 ISSN、后者按刊名，同一份数据走两条路结果可能不同。
+from journal_quartile import resolve_issns, zone_map_for_journals  # noqa: F401
+
+
 # ---------------------------------------------------------------- 分区回填
 
-def enrich_quartile_column(path, out_path=None, refresh=False, verbose=True):
-    """查期刊分区并回填到表的「分区」列（就地更新，或另存到 out_path）。
+def enrich_zone_column(path, out_path=None, refresh=False, verbose=True):
+    """查中科院《新锐期刊分区表》并回填「中科院分区」列。
 
-    依赖 journal_quartile.lookup_detail()，它走 `searchts read`（只读、不落盘）。
-    refresh=False 时只补「分区」列为空的行，已有的不动。
+    为什么只查中科院分区、不查 JCR：见 journal_quartile 模块文档
+    （JCR 需 Web of Science/JCR 订阅，无免费数据源）。
+
+    流程：
+      1) 按刊名去重，每本刊取一个 DOI
+      2) 无 ISSN 的刊 → Crossref 按 DOI 反查 ISSN（缓存 .issn_cache.json）
+      3) letpub_zone(issn=...) 优先，缺 ISSN 才退回刊名
+      4) 写 "1区"~"4区" / "未收录"，列强制文本格式
     """
     from openpyxl import load_workbook
-    from journal_quartile import lookup_detail
 
     if not os.path.exists(path):
         raise SystemExit(f"[ERROR] 找不到表：{path}")
@@ -592,16 +625,17 @@ def enrich_quartile_column(path, out_path=None, refresh=False, verbose=True):
         raise SystemExit(f"[ERROR] 表中没有「期刊」列，无法查询分区。"
                          f"现有列：{headers}")
     v_idx = headers.index("期刊") + 1
-    if "分区" in headers:
-        q_idx = headers.index("分区") + 1
+    ZONE_COL = "中科院分区"
+    if ZONE_COL in headers:
+        q_idx = headers.index(ZONE_COL) + 1
     else:
         q_idx = len(headers) + 1
-        ws.cell(row=1, column=q_idx, value="分区")
+        ws.cell(row=1, column=q_idx, value=ZONE_COL)
         if verbose:
-            print("[INFO] 表中原本没有「分区」列，已在末尾新增")
+            print(f"[INFO] 表中原本没有「{ZONE_COL}」列，已在末尾新增")
+    d_idx = headers.index("DOI") + 1 if "DOI" in headers else None
 
-    # 收集待查行
-    targets = []                          # (行号, 刊名)
+    targets = []                          # (行号, 刊名, DOI)
     for r in range(2, ws.max_row + 1):
         v = ws.cell(row=r, column=v_idx).value
         v = v.strip() if isinstance(v, str) else ""
@@ -611,34 +645,33 @@ def enrich_quartile_column(path, out_path=None, refresh=False, verbose=True):
         cur = cur.strip() if isinstance(cur, str) else ""
         if cur and not refresh:
             continue
-        targets.append((r, v))
+        doi = ""
+        if d_idx:
+            doi = str(ws.cell(row=r, column=d_idx).value or "").strip()
+        targets.append((r, v, doi))
 
     if not targets:
         print("没有需要回填的行（分区列已全部有值；要全部重查加 --refresh）")
         return path
 
-    uniq = sorted({n for _, n in targets})
+    first_doi = {}
+    for _, name, doi in targets:
+        first_doi.setdefault(name, doi)
+
     if verbose:
-        print(f"待回填 {len(targets)} 行，涉及 {len(uniq)} 种期刊"
+        print(f"待回填 {len(targets)} 行，涉及 {len(first_doi)} 种期刊"
               f"（{'(全部重查)' if refresh else '(只补空值)'}）")
 
-    qmap = {}
-    for i, name in enumerate(uniq, 1):
-        q, src = lookup_detail(name)
-        qmap[name] = q
-        if verbose:
-            print(f"  [{i}/{len(uniq)}] {name} -> {q or 'unknown'}"
-                  f"{('   [' + src + ']') if q else '   [' + src + ']'}")
+    zmap = zone_map_for_journals(first_doi, refresh=refresh, verbose=verbose)
 
     filled = 0
-    for r, name in targets:
-        q = qmap.get(name)
-        if q:
-            ws.cell(row=r, column=q_idx, value=q)
+    for r, name, _ in targets:
+        z = zmap.get(name)
+        if z:
+            ws.cell(row=r, column=q_idx, value=f"{z}区")
             filled += 1
         else:
-            ws.cell(row=r, column=q_idx, value="unknown")
-    # 分区列强制文本，避免 Q1/Q2 之类被 Excel 当别的类型
+            ws.cell(row=r, column=q_idx, value="未收录")
     for r in range(2, ws.max_row + 1):
         ws.cell(row=r, column=q_idx).number_format = "@"
 
@@ -650,29 +683,24 @@ def enrich_quartile_column(path, out_path=None, refresh=False, verbose=True):
                          f"请关闭后重试，或用 --out 指定另一个文件名。")
 
     dist = {}
-    for name in uniq:
-        k = qmap.get(name) or "unknown"
+    for name in first_doi:
+        k = f"{zmap.get(name)}区" if zmap.get(name) else "未收录"
         dist[k] = dist.get(k, 0) + 1
 
-    if not verbose:
-        # 省 token 模式：只出一两行，不逐刊打印
-        print(f"[QUIET] 回填 {len(targets)} 行 / {len(uniq)} 刊 | "
-              + " ".join(f"{k}={v}" for k, v in sorted(dist.items()))
-              + f" | 已写回 {filled} 行")
+    body = "  ".join(f"{k}={v}" for k, v in sorted(dist.items()))
+    if verbose:
+        print("-" * 60)
+        print(f"已写回 {filled}/{len(targets)} 行 -> {dest}")
+        print("中科院分区分布：" + body)
+    else:
+        print(f"[QUIET] 回填 {len(targets)} 行 / {len(first_doi)} 刊 | {body} | 已写回 {filled} 行")
         print(f"[QUIET] -> {dest}")
-        unk = dist.get("unknown", 0)
-        if unk:
-            print(f"[QUIET][须告知用户] {unk} 刊未被 journalmetrics.org 收录，"
-                  f"已标 unknown；按分区筛选时它们会被排除，可能漏检本属 Q1/Q2 的期刊")
-        return dest
 
-    print("-" * 60)
-    print(f"已写回 {filled}/{len(targets)} 行 -> {dest}")
-    print("期刊分区分布：" + "  ".join(f"{k}={v}" for k, v in sorted(dist.items())))
-    unk = dist.get("unknown", 0)
+    unk = dist.get("未收录", 0)
     if unk:
-        print(f"注意：{unk} 种期刊未在 journalmetrics.org 查到分区，已标记 unknown。"
-              f"按分区筛选时它们会被排除，须向用户说明可能漏检本属 Q1/Q2 的期刊。")
+        msg = (f"{unk} 种期刊在 LetPub 未收录（或查询失败），标为「未收录」；"
+               f"按分区筛选时会被排除。实测这类多为会议论文集、区域性期刊与新刊。")
+        print(f"[注意] {msg}" if verbose else f"[QUIET][须告知用户] {msg}")
     return dest
 
 
@@ -687,13 +715,16 @@ def main():
     g.add_argument("--filter", action="store_true", help="按条件筛选并输出少量明细")
     g.add_argument("--selected", action="store_true", help="输出「选中」列勾选的 PaperID")
     g.add_argument("--from-json", metavar="JSON", help="从 json 生成 xlsx（一次性落盘）")
-    g.add_argument("--enrich-quartile", action="store_true",
-                   help="查期刊分区并回填到「分区」列")
+    g.add_argument("--enrich-zone", action="store_true",
+                   help="查中科院《新锐期刊分区表》并回填「中科院分区」列（ISSN 优先）")
+    g.add_argument("--enrich-quartile", action="store_true", help=argparse.SUPPRESS)
 
     ap.add_argument("--year-min", type=int)
     ap.add_argument("--year-max", type=int)
     ap.add_argument("--min-citations", type=int)
-    ap.add_argument("--quartile", help="逗号分隔，如 Q1,Q2")
+    ap.add_argument("--zone",
+                    help="按中科院分区筛选，逗号分隔，如 1,2（也接受 1区,2区）")
+    ap.add_argument("--quartile", help=argparse.SUPPRESS)
     ap.add_argument("--title-contains")
     ap.add_argument("--venue-contains")
     ap.add_argument("--has-abstract", action="store_true")
@@ -711,11 +742,11 @@ def main():
                     help="**只输出一行统计**，不打印任何论文明细（省 token）")
     ap.add_argument("--out", help="把结果导出成新的 xlsx")
     ap.add_argument("--refresh", action="store_true",
-                    help="配合 --enrich-quartile：连已有分区也一并重查")
+                    help="配合 --enrich-zone：连已有分区（含未收录）也一并重查")
     ap.add_argument("--prefix", default="论文元数据")
     ap.add_argument("--top", type=int, default=DEFAULT_TOTAL_LIMIT,
-                    help=f"写入表的篇数上限（默认 {DEFAULT_TOTAL_LIMIT}；"
-                         f"候选不足则有多少存多少；传 0 表示不限）")
+                    help="写入表的篇数上限；**默认不限**（闸门后有多少写多少）；"
+                         "传 0 同义；需要更小的表就显式给 N")
 
     args = ap.parse_args()
 
@@ -740,8 +771,18 @@ def main():
         return
 
     if args.enrich_quartile:
-        enrich_quartile_column(args.xlsx, out_path=args.out, refresh=args.refresh,
-                               verbose=not args.quiet)
+        raise SystemExit(
+            "[ERROR] --enrich-quartile 已废弃：本 skill 不再提供 JCR 四分位"
+            "（需 Web of Science/JCR 订阅，无免费数据源）。请改用 --enrich-zone"
+            "（中科院《新锐期刊分区表》，1~4 区）。")
+
+    if args.quartile:
+        raise SystemExit(
+            "[ERROR] --quartile 已废弃，请改用 --zone 1,2（中科院分区）。")
+
+    if args.enrich_zone:
+        enrich_zone_column(args.xlsx, out_path=args.out, refresh=args.refresh,
+                           verbose=not args.quiet)
         return
 
     headers, rows = read_table(args.xlsx)

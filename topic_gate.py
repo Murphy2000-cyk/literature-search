@@ -20,23 +20,22 @@
 
 ## ⚠️ 闸门是按主题配置的，不是一套词表打天下
 
-内置的 `example-llm-reasoning` 只是**结构示例**，只适配「大语言模型的推理能力」这一个题目。
+内置的 `building-envelope-ndt` 只覆盖「建筑围护结构/外保温 的无损检测」。
 实测：拿它去判别的题目，13 个真实标题只过 3 个
-（题目 B 0/4、题目 C 0/3、题目 D 0/3）。
+（脱粘界面非线性振动 0/4、FEM+神经网络 0/3、光纤外立面检测 0/3）。
 
 **换题目就要换配置** —— 写进 `gate_profiles.json`（`save_profile()` / `build_profile()`）。
 
 ## 匹配规则（两处实测踩坑）
 
-- 短词（≤5 字符，如 llm / qa / model）**必须词边界匹配** ——
-  纯子串会把 sto`**`rag`**`e` 当成 `rag`、w`**`all`**`et` 当成 `wall`，
-  把别的领域的论文误放进来。
-  实现上给了可选复数 `s?`，`model` 即覆盖 models 而不碰 modelling。
-- 匹配前先把重音折叠为 ASCII，这样词表里写 ASCII 拼法也能命中正文里的带重音写法
-  （`naive` 也能匹配 `naïve`）。
-- ⚠️ **词干不能当词边界词用**：实测把 `model` 当词位时（5 字符走词边界），
-  `modelling` / `modelled` **都匹配不上**（`model` 后面还跟着 `l`），一口气误杀 5 篇。
-  正确写法是完整词或更长的词干（长度 >5 自动走子串匹配）。
+- 短词（≤5 字符，如 gpr / ndt / wall）**必须词边界匹配** ——
+  纯子串会把 `re`**`nde`**`ring` 当成 `nde`、`w`**`all`**`et` 当成 `wall`。
+  实现上给了可选复数 `s?`，`wall` 即覆盖 walls 而不碰 wallet。
+- 匹配前先把重音折叠为 ASCII，这样 `facade` 一个词位同时覆盖
+  facade / façades / façade。
+- ⚠️ **词干不能当词边界词用**：实测把 `facad` 当词位时，
+  `facade` / `facades` **都匹配不上**（`facad` 后面还跟着 `e`），一口气误杀 5 篇。
+  正确写法是完整词 `facade`（长度 >5 自动走子串匹配，覆盖单复数）。
 
 ## 过窄自检
 
@@ -54,56 +53,58 @@ import unicodedata
 from typing import Dict, List, Tuple
 
 # ============================================================ 内置主题配置
-# 示例：「大语言模型的推理能力」—— 2 个闸门 × 约 50 词
-#
-# ⚠️ 这只是一份**结构示例**，用来演示"2~3 个轴、每轴约 50 词"的配置尺度。
-#    正式检索前必须为本次题目另建 profile。
+# 「建筑围护结构 / 外保温 的无损检测」—— 2 个闸门 × 约 50 词
 
-# ---- 闸门 1：对象 / 方法（47 词）----
+# ---- 闸门 1：检测方法 / 信号（53 词）----
 METHOD_TERMS: List[str] = [
-    "language model", "large language", "llm", "foundation model",
-    "transformer", "decoder", "encoder-decoder", "attention",
-    "instruction tuning", "instruction following", "fine-tuning",
-    "sft", "rlhf", "dpo", "alignment", "prompt", "prompting",
-    "in-context learning", "few-shot", "zero-shot", "chain-of-thought",
-    "chain of thought", "self-consistency", "tree of thought",
-    "scratchpad", "reasoning step", "distillation", "quantization",
-    "mixture of experts", "moe", "agent", "tool use", "tool calling",
-    "retrieval augmented", "rag", "context window", "tokenization",
-    "pretraining", "post-training", "adapter", "lora", "peft",
-    "open-weight", "inference", "decoding", "sampling", "temperature",
+    "thermograph", "infrared", "infra-red", "ir camera", "thermal imag",
+    "thermal camera", "thermal map", "thermal anomal", "thermal defect",
+    "thermal inspection", "thermal survey", "thermogram", "thermovision",
+    "lock-in", "pulsed thermograph", "active thermograph", "passive thermograph",
+    "ground penetrating", "ground-penetrating", "gpr", "radar", "georadar",
+    "radargram", "ultrasonic", "ultrasound", "air-coupled", "guided wave",
+    "lamb wave", "impact echo", "impact-echo", "acoustic", "sonic", "sounding",
+    "tap test", "hammer tap", "coin tap", "vibration", "vibrometer",
+    "laser doppler", "modal", "impedance", "resonance",
+    "non-destructive", "nondestructive", "non destructive", "non-destruct",
+    "ndt", "nde", "ndi", "noncontact", "non-contact", "non contact", "contactless",
 ]
 
-# ---- 闸门 2：任务 / 评测（47 词）----
-# ⚠️ 没有黑名单，所以这一轴的用词就是唯一的口径。
-# 轴内是"或"，50 个词足以覆盖主要同义词、缩写与拼写变体；
-# 但每多一轴，"必须全中"的合取就更紧，误杀风险越高。
-TASK_TERMS: List[str] = [
-    "reasoning", "logical reasoning", "deductive", "inductive",
-    "abductive", "arithmetic", "math word problem", "mathematical",
-    "symbolic", "commonsense", "causal", "multi-hop", "multi step",
-    "planning", "question answering", "qa", "benchmark", "evaluation",
-    "accuracy", "mmlu", "gsm8k", "humaneval", "bbh",
-    "hallucination", "faithfulness", "robustness", "generalization",
-    "out-of-distribution", "contamination", "error analysis",
-    "chain validity", "self-verification", "verifier", "critique",
-    "process reward", "outcome reward", "pass at k", "majority voting",
-    "scaling law", "emergent ability", "ablation", "baseline",
-    "human evaluation", "annotation", "metric", "score", "correlation",
+# ---- 闸门 2：对象 / 领域（58 词）----
+# ⚠️ 没有黑名单，所以这一轴的用词就是唯一的口径：
+# 既要有 `insulat` 这种词干保证召回（外保温文献的标题措辞极分散），
+# 又要靠 `building / wall / facade / envelope / etics…` 把语境钉在建筑上。
+# 代价：电气绝缘、管道保温这类同名标题会一并放行 —— 这是"不要误杀"取向下的
+# 已知取舍，交由后续排序和人工复核处理（实测它们 BGE 分普遍低于真领域论文）。
+DOMAIN_TERMS: List[str] = [
+    "insulat", "etics", "eifs", "thermal protection", "building envelope",
+    "envelope", "facade", "cladding", "render", "plaster", "masonry", "brick",
+    "wall", "roof", "ceiling", "external wall", "exterior wall",
+    "thermal bridge", "thermal transmittance", "u-value", "u value",
+    "thermal resistance", "thermal property", "airtightness", "air leakage",
+    "heat loss", "heat flux", "hygrothermal", "moisture", "condensation",
+    "damp", "tile", "coating", "finish", "eps", "xps", "polystyrene",
+    "mineral wool", "rock wool", "polyurethane", "aerogel", "vacuum insulation",
+    "sandwich panel", "precast", "concrete wall", "stone wall", "brickwork",
+    "building", "dwelling", "residential", "apartment", "house", "housing",
+    "high-rise", "tower block", "construction", "civil engineering",
 ]
 
-DEFAULT_PROFILE: Dict = {
-    "id": "example-llm-reasoning",
-    "topic": "大语言模型的推理能力（示例）",
+BUILDING_NDT_PROFILE: Dict = {
+    "id": "building-envelope-ndt",
+    "topic": "建筑围护结构 / 外保温 的无损检测",
     "axes": {
-        "对象方法": METHOD_TERMS,
-        "任务评测": TASK_TERMS,
+        "检测方法": METHOD_TERMS,
+        "对象领域": DOMAIN_TERMS,
     },
 }
 
 # ---- 兼容旧名（早期版本按这些名字引用）----
-METHOD_ALIASES = METHOD_TERMS
-TASK_ALIASES = TASK_TERMS
+NDT_METHOD_TERMS = METHOD_TERMS
+INSPECTION_TERMS: List[str] = []
+ENVELOPE_TERMS = DOMAIN_TERMS
+NON_BUILDING_TERMS: List[str] = []
+STRONG_BUILDING_TERMS: List[str] = []
 
 PROFILES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "gate_profiles.json")
@@ -155,16 +156,16 @@ def build_profile(pid: str, topic: str, axes: Dict[str, List[str]]) -> Dict:
 def resolve_profile(profile=None) -> Dict:
     """把 None / id 字符串 / dict 统一成 profile 字典。"""
     if profile is None:
-        return DEFAULT_PROFILE
+        return BUILDING_NDT_PROFILE
     if isinstance(profile, dict):
         return profile
     profs = load_profiles()
     if profile in profs:
         return profs[profile]
-    if profile == DEFAULT_PROFILE["id"]:
-        return DEFAULT_PROFILE
+    if profile == BUILDING_NDT_PROFILE["id"]:
+        return BUILDING_NDT_PROFILE
     raise KeyError(f"找不到主题配置 {profile!r}。已有："
-                   f"{[DEFAULT_PROFILE['id']] + sorted(profs)}")
+                   f"{[BUILDING_NDT_PROFILE['id']] + sorted(profs)}")
 
 
 # ============================================================ 匹配
@@ -175,7 +176,7 @@ _ACCENTS = str.maketrans({"ç": "c", "é": "e", "è": "e", "ê": "e", "ï": "i",
 
 
 def _norm(text: str) -> str:
-    """小写 + 重音折叠：`naïve` → `naive`，词表写 ASCII 即可命中带重音的写法。"""
+    """小写 + 重音折叠：`façade` → `facade`，一个词位覆盖两种拼写。"""
     t = unicodedata.normalize("NFKD", text or "")
     t = "".join(c for c in t if not unicodedata.combining(c))
     return t.lower().translate(_ACCENTS)
@@ -186,7 +187,7 @@ def _match(text: str, terms: List[str]) -> List[str]:
 
     - 长度 ≤5 的词：**词边界**匹配 + 可选复数 `s?`
       （`wall` 覆盖 walls，但不碰 wallet）。
-    - 长度 >5 的词：子串匹配，覆盖词干变形（reason* / forecast*）。
+    - 长度 >5 的词：子串匹配，覆盖词干变形（insulat* / thermograph*）。
     """
     t = _norm(text)
     out = []
@@ -205,11 +206,13 @@ def gate(title: str, profile=None, abstract: str = "") -> Tuple[bool, Dict]:
 
     **判定依据 = 标题 + 摘要**（用户 2026-09-20 指定）。
     检索响应现在已直接带回摘要（实测覆盖 74~76%），白放着不用会白白误杀一批
-    「方法只写在摘要里、标题没提」的论文。摘要为空时自动退回只用标题。
+    「方法只写在摘要里、标题没提」的论文 —— 实测就是这么丢掉
+    `A scoping review of NDT techniques in building performance diagnostic
+    inspections`（被引 120）的。摘要为空时自动退回只用标题。
 
     Args:
         title: 论文标题
-        profile: None = 内置示例配置（example-llm-reasoning）；
+        profile: None = 内置「建筑外保温无损检测」配置；
                  字符串 = gate_profiles.json 里的 id；dict = 直接给一条配置
         abstract: 论文摘要（可空）
 
@@ -265,7 +268,7 @@ def apply_gate(items, profile=None, title_getter=None, abstract_getter=None,
         交付前必须先人工翻看 rejected 前若干条确认。
 
     为什么必须有这个自检：闸门是"必须命中所有轴"的合取，
-    轴设多了、词写窄了就会大面积误杀 —— 实测一套只适配某个题目的配置拿去判
+    轴设多了、词写窄了就会大面积误杀 —— 实测一套只适配外保温的配置拿去判
     别的题目，通过率是 0%，而那不是"该领域没有文献"。
     """
     get_t = title_getter or (
@@ -316,8 +319,8 @@ if __name__ == "__main__":
         return " ∧ ".join(f"{k}({len(v)}词)" for k, v in (p.get("axes") or {}).items())
 
     if args.list_profiles:
-        print(f"内置 {DEFAULT_PROFILE['id']}：{DEFAULT_PROFILE['topic']}")
-        print(f"     {_desc(DEFAULT_PROFILE)}")
+        print(f"内置 {BUILDING_NDT_PROFILE['id']}：{BUILDING_NDT_PROFILE['topic']}")
+        print(f"     {_desc(BUILDING_NDT_PROFILE)}")
         for pid, p in load_profiles().items():
             print(f"自定义 {pid}：{p.get('topic')}")
             print(f"     {_desc(p)}")
@@ -325,7 +328,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.size:
-        print(_desc(DEFAULT_PROFILE))
+        print(_desc(BUILDING_NDT_PROFILE))
         sys.exit(0)
 
     if args.explain:
@@ -333,11 +336,14 @@ if __name__ == "__main__":
             print("\n" + explain(t, args.profile))
         sys.exit(0)
 
-    print(f"内置配置 {DEFAULT_PROFILE['id']}：{_desc(DEFAULT_PROFILE)}")
+    print(f"内置配置 {BUILDING_NDT_PROFILE['id']}：{_desc(BUILDING_NDT_PROFILE)}")
     print("规则：命中【全部】闸门才通过；无黑名单。")
     for t in [
-        "Chain-of-thought prompting elicits reasoning in large language models",
-        "A survey of evaluation benchmarks for multi-step reasoning",
-        "Scaling laws for emergent abilities in foundation models",
+        "Combining thermography and computer simulation to identify and assess "
+        "insulation defects in the construction of building facades",
+        "A scoping review of non-destructive testing (NDT) techniques in "
+        "building performance diagnostic inspections",
+        "External Thermal Insulation Composite Systems (ETICS) from Industry "
+        "and Academia Perspective",
     ]:
         print("\n" + explain(t))

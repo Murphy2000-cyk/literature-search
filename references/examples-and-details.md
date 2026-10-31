@@ -82,17 +82,17 @@ Abstract: xxx
 
 ```json
 {
-  "query": "large language model reasoning",
+  "query": "external wall insulation NDT",
   "filter": "Year: 2020-2026, Q1/Q2, journal_only",
   "timestamp": "2026-07-31T14:00:00",
   "count": 45,
   "papers": [
     {
       "paper_id": "abc123def456",
-      "title": "Chain-of-thought prompting for multi-step reasoning",
+      "title": "Infrared thermography for building facade inspection",
       "authors": ["Zhang W", "Li X", "Wang Y"],
       "year": 2022,
-      "venue": "Journal of Example Studies",
+      "venue": "Building and Environment",
       "quartile": "Q1",
       "citation_count": 35,
       "is_conference": false,
@@ -144,14 +144,14 @@ Abstract: xxx
 ### 示例3：多轮检索 + BGE 排序
 
 ```
-输入：搜索 "大语言模型推理能力" 的相关论文
+输入：搜索 "外墙保温层无损检测技术" 的相关论文
 
 预期：
   1. Agent 将中文主题翻译为多个英文查询词：
-     - "large language model reasoning"
-     - "chain-of-thought prompting"
-     - "mathematical word problem solving"
-     - "multi-hop question answering"
+     - "external wall insulation non-destructive testing"
+     - "infrared thermography building facade insulation"
+     - "ground penetrating radar wall insulation"
+     - "acoustic impact tile debonding facade"
   2. 每个查询词分别检索 100 篇
   3. 合并 + 按 paper_id 去重
   4. 客户端筛选（排除会议/预印本）
@@ -191,7 +191,7 @@ Abstract: xxx
 | search API 单页上限 | 100 篇 |
 | 单查询结果硬上限 | **1000 条**（`offset + limit ≤ 1000`）。2023-10-31 起由 10000 下调；超出须改用 `/paper/search/bulk` |
 | 查询语法 | `/paper/search` **纯文本关键词，无布尔语法**。需要 `+`(AND) / `\|`(OR) / `-`(排除) / `""`(短语) / `*`(前缀) / `~N`(编辑距离) 须改用 `/paper/search/bulk` |
-| `total` 字段 | **近似值，不可信**。实测只加一个词，`total` 由 27,604 涨到 1,803,131（**65 倍**）。**禁止用于覆盖率汇报** |
+| `total` 字段 | **近似值，不可信**。实测 `debonding` = 27,604 而 `debonding nonlinear` = 1,803,131（涨 65 倍）。**禁止用于覆盖率汇报** |
 
 ---
 
@@ -199,27 +199,27 @@ Abstract: xxx
 
 ### 模型（v2.0 起）
 
-**与本机另一套 BGE 服务使用同一套模型。**
+**与结构化知识库（`Agent-Structured-KB` 的 `db.py` / `tools/reranker.py`）使用同一套模型。**
 
 | 模型 | 维度 | 本地缓存 | 用途 |
 |------|------|------|------|
 | `BAAI/bge-base-en-v1.5` | 768 | ~419MB | 英文查询 |
 | `BAAI/bge-base-zh-v1.5` | 768 | ~781MB | 中文查询 |
 
-若本地已有缓存则**不需要联网下载**（可用 `HF_HUB_OFFLINE=1` 强制离线验证）。
-⚠️ **首次加载实测约 100 秒**（CPU）。那个常驻服务里的模型在**它自己的进程**内，
+本机 `~/.cache/huggingface/hub/` 已有缓存，**不需要联网下载**（可用 `HF_HUB_OFFLINE=1` 强制离线验证）。
+⚠️ **首次加载实测约 100 秒**（CPU）。知识库那个常驻服务里的模型在**它自己的进程**内，
 Python 进程之间无法共享，所以论文检索每次开新进程都要重付这笔时间。
 
-> v2.0 之前用的是 `bge-small-*`（384 维），与该常驻服务不一致，已改。
+> v2.0 之前用的是 `bge-small-*`（384 维），与知识库不一致，已改。
 
 ### 评分逻辑
 
 ```
-查询: "large language model reasoning"
+查询: "external wall insulation non-destructive testing"
     ↓ 按空格拆分 + 去停用词
-关键词: ["large", "language", "model", "reasoning"]
+关键词: ["external", "wall", "insulation", "non", "destructive", "testing"]
     ↓ BGE 编码 (每个关键词独立编码为 768 维向量)
-    ↓ 相似度矩阵 (4个关键词 x N篇论文)
+    ↓ 相似度矩阵 (6个关键词 x N篇论文)
     ↓ 每篇论文得分 = 各关键词相似度的【平均值】（按列求均值）
     ↓ 按得分降序排列（仅排序，不删除任何论文）
 ```

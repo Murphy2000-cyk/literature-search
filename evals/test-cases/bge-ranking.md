@@ -2,7 +2,7 @@
 
 ## Input
 ```
-搜索 "large language model reasoning" 的论文，Q1/Q2
+搜索 "external wall insulation non-destructive testing" 的论文，Q1/Q2
 ```
 
 ## Expected
@@ -10,7 +10,7 @@
 2. Client-side filter: exclude conference/preprint
 3. JCR quartile lookup + filter Q1/Q2
 4. BGE ranking:
-   - Query split into keywords: ["large", "language", "model", "reasoning"]
+   - Query split into keywords: ["external", "wall", "insulation", "non", "destructive", "testing"]
    - Each keyword encoded separately
    - Each paper score = **mean** of keyword-title similarities (v2.0；此前为 sum)
    - Papers sorted by score descending (NOT filtered)

@@ -1,10 +1,10 @@
 # literature-search
 
-`literature-search` 是用于文献检索的 skill，以 **Semantic Scholar** 为主数据源。通过内置的 BGE 模型对数据进行筛选和排序，根据用户需求返回学术文献。大模型只会接收到「检索、筛选、排序」后的最终数据，因此极大程度地节约了 token 消耗。当前版本 **v1.9.1**，默认使用 DSH 的 skill 格式；安装到其他 Agent 时需要修改 skill 的触发条件。
+`literature-search` 是用于文献检索的 skill，以 **Semantic Scholar** 为主数据源。通过内置的 BGE 模型对数据进行筛选和排序，根据用户需求返回学术文献。大模型只会接收到「检索、筛选、排序」后的最终数据，因此极大程度地节约了 token 消耗。当前版本 **v2.0.0**，默认使用 DSH 的 skill 格式；安装到其他 Agent 时需要修改 skill 的触发条件。
 
 **English**
 
-`literature-search` is a literature-retrieval skill for **DeepSeek Harness (DSH)**. It searches academic literature on **Semantic Scholar** as its primary data source, then uses a built-in BGE model to score and rank the candidates and filters them by a topic gate plus the user's requirements, so the model only ever receives the final retrieved, filtered and ranked data. That saves a large amount of tokens. Current version: **v1.9.1**. It ships in DSH's skill format, so installing it into another agent requires editing the skill's trigger conditions.
+`literature-search` is a literature-retrieval skill for **DeepSeek Harness (DSH)**. It searches academic literature on **Semantic Scholar** as its primary data source, then uses a built-in BGE model to score and rank the candidates and filters them by a topic gate plus the user's requirements, so the model only ever receives the final retrieved, filtered and ranked data. That saves a large amount of tokens. Current version: **v2.0.0**. It ships in DSH's skill format, so installing it into another agent requires editing the skill's trigger conditions.
 
 ---
 
@@ -46,13 +46,15 @@
 
 | 环节 | 做什么 | 产物 |
 |---|---|---|
-| **检索** | 3~4 轮 ≤5 词关键词，每轮 200 篇（2 页）→ 合并去重 | 候选池 |
+| **检索** | 3~4 轮 ≤5 词关键词，每轮 500 篇（5 页）→ 合并去重 | 候选池 |
 | **排序** | BGE 对**每组关键词独立评分**（绝不用别组关键词打分）→ 合并降序 | 带 BGE 分的表 |
 | **主题闸门** | 按本次题目配置的 2~3 个轴（每轴约 50 词）过滤；自带"过窄自检" | 领域内候选 |
 | **落盘** | 全部元数据一次写成 xlsx（含 DOI / 摘要 / PDF 链接 / 分区） | `<前缀>.xlsx` |
 | **按需读取** | `--stats` / `--filter` / `--select` / `--top-n` / `--quiet` / `--selected` | 只把需要的一小部分读进上下文 |
-| **分区回填** | `--enrich-quartile` 查 JCR 分区并写回表里（走只读抓取，不落盘） | 带分区的表 |
+| **分区回填** | `--enrich-zone` 查中科院新锐分区（LetPub，1–4 区）并写回表里 | 带分区的表 |
 | **备用源** | Semantic Scholar 不可用时，**经用户同意后**启用 Crossref（带硬门禁） | 备用结果 |
+| **摘要补全** | `abstract_fill.py`：Crossref → OpenAlex → **Elsevier API** → PubMed → 页面渲染，五源逐级兜底 | 带「摘要来源」的表 |
+| **会议识别** | `venue_rules.py`：按刊名规则识别标成 JournalArticle 的会议论文集（带正规期刊白名单） | 带「疑似会议」列的表 |
 | **如实汇报** | 每次检索自动产出**检索完整性报告**（哪些查询失败/截断） | `检索完整性报告.txt/.json` |
 
 **模块一览**
@@ -61,13 +63,15 @@
 |---|---|
 | `semantic_scholar_search.py` | 主流程：检索、分页、合并去重、筛选、分区集成、保存；含失败重试与上报 |
 | `search_pipeline.py` | **一步流程**：检索 → BGE 每组独立评分 → 合并排序 → 落盘 Excel |
-| `paper_table.py` | 元数据表落盘与按需读取（`--select` / `--top-n` / `--quiet` / `--enrich-quartile`） |
+| `paper_table.py` | 元数据表落盘与按需读取（`--select` / `--top-n` / `--quiet` / `--enrich-zone`） |
 | `relevance_scorer.py` | BGE 多组关键词相关性排序（`rank_groups()` 每组独立评分后全局排序） |
 | `topic_gate.py` | **主题闸门**：判断标题+摘要是否属于目标领域，含过窄自检 |
 | `paper_details.py` | Phase 2：按 paper_id / 标题批量取详情 |
 | `translator.py` | 批量翻译标题与摘要（可选，缺凭据自动跳过并保留英文） |
-| `journal_quartile.py` | JCR 分区查询（journalmetrics.org，带本地缓存） |
+| `journal_quartile.py` | 中科院《新锐期刊分区表》查询（LetPub，带本地缓存与 TTL） |
 | `crossref_fallback.py` | 备用数据源（未获用户同意会直接拒绝执行，退出码 3） |
+| `abstract_fill.py` | **摘要补全**：五源逐级兜底，回填「摘要」列并记录「摘要来源」 |
+| `venue_rules.py` | **会议论文集识别**：刊名规则 + 正规期刊白名单 |
 | `bge_status.py` | 查看本机 BGE 内存占用、区分中英文分支 |
 | `evals/` | 失败重试策略、如实汇报留痕、备用源门禁的自测套件 |
 
@@ -119,6 +123,8 @@ BGE 打分是「标题向量 与 查询词向量 的余弦相似度**均值**」
 ---
 
 ## 安装（DSH）
+
+> 完整安装步骤、两个 API Key 的申请地址与常见问题，见 **[INSTALL.md](INSTALL.md)**。
 
 DSH 的 skill 发现深度**只有一层**，必须是 `<root>/<name>/SKILL.md` 或平铺的 `<root>/<name>.md`。
 把本目录整体放进任一扫描根即可（rank 小者优先，同名时浅层胜出）：
