@@ -17,7 +17,7 @@
 ### 2.1 两阶段架构
 
 ```
-Phase 1  多轮检索 → 合并去重 → 客户端筛选 → JCR 分区 → BGE 排序 → 翻译标题
+Phase 1  多轮检索 → 合并去重 → 客户端筛选 → 中科院分区 → BGE 排序 → 翻译标题
          产出：文献检索_筛选结果_*.txt/.json（含 PaperID，不含摘要）
                               ↓
                      用户审查，挑选 PaperID
@@ -49,6 +49,8 @@ Phase 2 允许用户**直接报论文标题**，用 `find_paper_id_by_title()` �
 | `evals/test_ratelimit.py` | 失败重试策略自测（请求次数、密钥携带、无匿名降级） |
 | `evals/test_report.py` | 如实汇报留痕自测（确实未命中 / 查询失败 / 达到抓取上限） |
 | `evals/test_crossref_gate.py` | 备用源门禁自测（未获用户同意时拒绝执行且不发请求） |
+| `abstract_fill.py` | **摘要补全**：五源逐级兜底，回填「摘要」列并记录「摘要来源」（见 §3.7） |
+| `venue_rules.py` | **会议论文集识别**：刊名规则 + 正规期刊白名单（见 §3.8） |
 
 ### 2.3 检索参数与默认值
 
@@ -717,7 +719,7 @@ IEEE 1、T&F 1、Springer 1。
 
 ```
 e-Journal of Nondestructive Testing            47 篇
-Italian National Conference on Sensors         16 篇
+Italian National Conference on Sensors         41 篇
 Journal of Physics: Conference Series           8 篇
 E3S Web of Conferences                          3 篇
 INTER-NOISE / NOISE-CON                         2 篇
@@ -1000,7 +1002,7 @@ Semantic Scholar 失败时，**不得自行改用 Crossref 或其他源**。必�
 | 长时间无输出，随后返回 0 篇 | 旧版静默失败 | v1.3.1 已由失败上报机制修复；确认脚本捕获了 `ApiUnavailableError` |
 | 脚本十几分钟不结束 | 自定义脚本用了过长退避且未上报 | 删除自定义长退避，改用 skill 内置 `RETRY_WAITS_S`（10/10，共 3 次请求，累计约 20 秒） |
 | 结果大量 off-topic | 查询词过宽 | 缩窄查询词，加相关性打分与人工筛选 |
-| 分区大量 unknown | 期刊未被分区库收录 | 属预期；说明局限，必要时人工补录 |
+| 分区大量未收录 | 期刊未被分区库收录 | 属预期；说明局限，必要时人工补录 |
 | 保存目录不符预期 | 默认落在 `~/literature-search-out` | 设 `LITSEARCH_OUT_DIR`，或按第 6 节规范传 `save_dir` |
 | 翻译未生效但结果正常 | 缺 `ANTHROPIC_AUTH_TOKEN` | 属预期的降级行为，保留英文即可 |
 | 技能目录出现多余 HTML 文件 | `journal_quartile.py` 调 `searchts get` 的残留 | 定期清理；分区查询完毕检查当前工作目录 |

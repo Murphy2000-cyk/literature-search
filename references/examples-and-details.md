@@ -65,7 +65,7 @@ Authors: xxx
 Journal: xxx
 Year: xxx
 Citations: xxx
-Quartile: Q1
+Quartile: 1区
 DOI: 10.xxxx/xxxxx
 PaperID: xxxxxxxxxx
 BGE Score: 5.82
@@ -83,7 +83,7 @@ Abstract: xxx
 ```json
 {
   "query": "external wall insulation NDT",
-  "filter": "Year: 2020-2026, Q1/Q2, journal_only",
+  "filter": "Year: 2020-2026, 中科院 1/2 区, journal_only",
   "timestamp": "2026-07-31T14:00:00",
   "count": 45,
   "papers": [
@@ -93,7 +93,7 @@ Abstract: xxx
       "authors": ["Zhang W", "Li X", "Wang Y"],
       "year": 2022,
       "venue": "Building and Environment",
-      "quartile": "Q1",
+      "quartile": "1",
       "citation_count": 35,
       "is_conference": false,
       "is_journal": true,
@@ -130,12 +130,12 @@ Abstract: xxx
 ### 示例2：带 API 级筛选
 
 ```
-输入：搜索 "deep learning"，仅期刊论文，Q1 分区，2020-2026年，按引用量排序
+输入：搜索 "deep learning"，仅期刊论文，中科院 1 区，2020-2026年，按引用量排序
 
 预期：
   1. search API 带参数：publicationTypes=JournalArticle,Review, sort=citationCount:desc, year=2020-2026
   2. 客户端筛选：排除预印本
-  3. JCR 分区查询 + 过滤 Q1
+  3. 中科院新锐分区查询（`--enrich-zone`）+ 过滤 1 区
   4. BGE 排序
   5. batch API 获取摘要
   6. 保存结果
@@ -155,7 +155,7 @@ Abstract: xxx
   2. 每个查询词分别检索 100 篇
   3. 合并 + 按 paper_id 去重
   4. 客户端筛选（排除会议/预印本）
-  5. JCR 分区查询 + 过滤 Q1/Q2
+  5. 中科院新锐分区查询（`--enrich-zone`）+ 过滤 1–2 区
   6. BGE 多关键词标题排序
   7. batch API 获取摘要
   8. 保存结果（含 BGE 分数和 paper_id/DOI 索引）

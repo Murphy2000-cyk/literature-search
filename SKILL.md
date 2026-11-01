@@ -7,7 +7,7 @@ description: 学术文献检索（主源 Semantic Scholar）：3–4 轮 ≤5 �
 
 **版本 v2.0.1** · 遵循 Agent Skills 规范 · 宿主不是 DSH 时见 `INSTALL.md` 第七节
 
-主数据源 Semantic Scholar 的学术文献检索，**一次检索 6–8 次 API 调用**：
+主数据源 Semantic Scholar 的学术文献检索，**一次检索 15–20 次 API 调用**：
 3–4 轮关键词（每轮 ≤5 词，各取 500 篇）→ BGE 每组独立评分 → 主题闸门 → 落盘 Excel → 按需读取。
 
 **排错手册、故障复盘、闸门配置、归档规范见同目录 `AGENTS.md`；保存格式、使用示例、速率限制、BGE 排序说明见 `references/examples-and-details.md`。**
@@ -162,7 +162,7 @@ rep = searcher.search_report()       # 结构化数据，写入调研日志
 | 报告把故障记成 `[ok]` | 请求失败被当成"空结果"（v1.3.4 已修） | 只有 `200` + 空 `data` 才是 `ok`；`5xx`/网络错误一律 `failed` |
 | 失败后部分结果丢失 | 翻页中断时 `return` 未执行（v1.3.4 已修） | 捕获异常后必须用 `searcher.collected_partial()` 取回并落盘 |
 | 结果大量 off-topic | 关键词过宽（如泛用 GPR/thermal） | 缩窄查询词，对标题做相关性打分后再呈现 |
-| 分区大量 unknown | 该刊未被分区库收录 | 属预期，说明局限；需要中文分区时改用 `--letpub --issn <ISSN>` 重查 |
+| 分区大量未收录 | 该刊未被分区库收录 | 属预期，说明局限；需要按 ISSN 精确重查时用 `journal_quartile.letpub_zone(issn=...)`，不要按刊名查 |
 | 输出目录不符预期 | 默认 `~/literature-search-out` | 设 `LITSEARCH_OUT_DIR`，或按 `AGENTS.md` 归档规范指定 |
 
 ## 资源导航

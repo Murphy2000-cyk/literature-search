@@ -2,13 +2,13 @@
 
 ## Input
 ```
-搜索 "external wall insulation non-destructive testing" 的论文，Q1/Q2
+搜索 "external wall insulation non-destructive testing" 的论文，中科院 1–2 区
 ```
 
 ## Expected
 1. Search API fetches papers
 2. Client-side filter: exclude conference/preprint
-3. JCR quartile lookup + filter Q1/Q2
+3. 中科院新锐分区查询（`--enrich-zone`）+ 过滤 1–2 区
 4. BGE ranking:
    - Query split into keywords: ["external", "wall", "insulation", "non", "destructive", "testing"]
    - Each keyword encoded separately

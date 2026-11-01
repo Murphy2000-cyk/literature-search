@@ -33,10 +33,10 @@
 这个 skill 的做法是：
 
 1. 基于 Semantic Scholar 的 API 获得数据；
-2. 3–4 轮每轮 ≤5 个词的关键词，每轮取 200 篇，**一次检索只需 6–8 次 Semantic Scholar 请求**；
+2. 3–4 轮每轮 ≤5 个词的关键词，每轮取 500 篇，**一次检索需 15～20 次 Semantic Scholar 请求**；
    检索响应本身已直接带回 DOI（覆盖 88–95%）、摘要（74%）、OA 链接，**不需要再逐篇补详情**；
 3. 全部元数据一次性写进**一个 xlsx**，数据在脚本里流转，**只有 stdout 进上下文**。
-   实测"筛出 Q1 里最相关的前 10 篇"这条命令的 stdout **只有 2 行 ≈ 47 token**，
+   实测"筛出 1 区里最相关的前 10 篇"这条命令的 stdout **只有 2 行 ≈ 47 token**，
    而整表进上下文要 ≈ 9.7 万 token；
 4. 通过 BGE 进行相关性排序，并且设置了**主题闸门**和**用户需求**作为筛选条件，返回最终数据。
 
@@ -83,14 +83,14 @@
 
 ```
 ① 设 3~4 组英文关键词，每组 ≤5 个词，互为微调变体
-     每轮取 200 篇（= 2 页）→ 候选池最多 组数 × 200（3 组 → 最多 600）
+     每轮取 500 篇（= 5 页）→ 候选池最多 组数 × 500（3 组 → 最多 1500）
 ② BGE 对【每一组各自】评分 → 合并去重 → 按分全局降序 → 取前 200
 ③ 过主题闸门（2~3 个轴，命中全部轴才通过）
 ④ 一次性落盘成一个 xlsx
 ⑤ 之后按需读取，绝不整表进上下文
 ```
 
-**Semantic Scholar API 调用预算** = `ceil(每轮篇数 / 100) × 轮数`。默认即 `2 × 3~4 = 6~8 次请求`（外加少量 429 重试）。
+**Semantic Scholar API 调用预算** = `ceil(每轮篇数 / 100) × 轮数`。默认即 `5 × 3~4 = 15~20 次请求`（外加少量 429 重试）。
 
 ### 为什么是「短关键词」
 
@@ -188,7 +188,7 @@ BGE 用的是 `BAAI/bge-base-en-v1.5`（768 维，约 **419 MB**）。如果可�
 
 ### 外部 CLI（可选）
 
-`journal_quartile.py` 通过 `searchts read <url>` 抓取 journalmetrics.org 的分区页面。
+`journal_quartile.py` 通过 `searchts read <url>` 抓取 LetPub 的中科院新锐分区页面。
 **缺这个命令时分区查询不可用，其余功能全部正常**（脚本会返回 `找不到 searchts 命令` 并继续）。
 
 分区缓存（`.quartile_cache.json`）**不随仓库分发**：它是本机生成的大文件，且时效性强。
@@ -287,14 +287,14 @@ print(res["api_calls"], res["rounds"])
 python paper_table.py --xlsx 论文元数据.xlsx --stats
 
 # 只要一区、最相关的前 10 篇，直接导出，不经过阅读
-python paper_table.py --xlsx 论文元数据.xlsx --filter --quartile Q1 --top-n 10 \
+python paper_table.py --xlsx 论文元数据.xlsx --filter --zone 1 --top-n 10 \
     --out 一区前10.xlsx --quiet
 
 # 只要标题（一行一个）
 python paper_table.py --xlsx 论文元数据.xlsx --filter --select 标题 --out 标题.txt --quiet
 
 # 查分区并回填
-python paper_table.py --xlsx 论文元数据.xlsx --enrich-quartile --quiet
+python paper_table.py --xlsx 论文元数据.xlsx --enrich-zone --quiet
 
 # 读你在 Excel 里勾选的「选中」列
 python paper_table.py --xlsx 论文元数据.xlsx --selected
@@ -315,30 +315,34 @@ python topic_gate.py --explain "Chain-of-thought prompting elicits reasoning in 
 ```
 literature-search/
 ├── SKILL.md                      # 114 行，主指令：精简流程 + 硬性规则
-├── AGENTS.md                     # 903 行，驱动脚本模板、失败处理、排错手册、逐版本修复记录
-├── README.md / CHANGELOG.md / LICENSE / .gitignore
-├── semantic_scholar_search.py    # 1076 行，检索主流程（分页、去重、筛选、完整性报告）
-├── paper_table.py                # 675 行，元数据表落盘 / 按需读取
-├── relevance_scorer.py           # 406 行，BGE 多组评分（每组独立）
-├── translator.py                 # 367 行，批量翻译（可选，缺凭据自动跳过）
-├── topic_gate.py                 # 283 行，主题闸门（内置一套示例 profile）
-├── search_pipeline.py            # 268 行，一步流程入口
-├── paper_details.py              # 231 行，Phase 2 详情
-├── crossref_fallback.py          # 227 行，备用源（未获同意直接拒绝执行）
-├── journal_quartile.py           # 159 行，JCR 分区查询（带缓存）
-├── bge_status.py                 # 110 行，BGE 内存占用查看
+├── AGENTS.md                     # 1284 行，驱动脚本模板、失败处理、排错手册、逐版本修复记录
+├── README.md / CHANGELOG.md / INSTALL.md / LICENSE / .gitignore
+├── semantic_scholar_search.py    # 1289 行，检索主流程（分页、去重、筛选、完整性报告）
+├── paper_table.py                #  829 行，元数据表落盘 / 按需读取
+├── relevance_scorer.py           #  495 行，BGE 多组评分（每组独立）
+├── translator.py                 #  452 行，批量翻译（可选，缺凭据自动跳过）
+├── journal_quartile.py           #  382 行，中科院新锐分区查询（LetPub，带缓存与 TTL）
+├── topic_gate.py                 #  349 行，主题闸门（内置一套示例 profile）
+├── search_pipeline.py            #  341 行，一步流程入口
+├── abstract_fill.py              #  330 行，摘要补全（五源逐级兜底）
+├── paper_details.py              #  289 行，Phase 2 详情
+├── crossref_fallback.py          #  263 行，备用源（未获同意直接拒绝执行）
+├── bge_status.py                 #  131 行，BGE 内存占用查看
+├── venue_rules.py                #   79 行，会议论文集按刊名识别（带正规期刊白名单）
 ├── gate_profiles.json            # 你自己的主题闸门配置（含一套结构示例）
 ├── references/
-│   └── examples-and-details.md   # 213 行，产出格式、使用示例、速率限制、BGE 原理
+│   └── examples-and-details.md   #  281 行，产出格式、使用示例、速率限制、BGE 原理
 └── evals/
-    ├── test_report_failure_classification.py    # 90 行，故障分类自测
-    ├── test_ratelimit.py                        # 85 行，失败重试策略自测
-    ├── test_report.py                           # 72 行，如实汇报留痕自测
-    ├── test_crossref_gate.py                    # 34 行，备用源门禁自测
+    ├── test_abstract_fill.py                    # 120 行，摘要补全自测
+    ├── test_ratelimit.py                        # 113 行，失败重试策略自测
+    ├── test_report_failure_classification.py    # 109 行，故障分类自测
+    ├── test_report.py                           #  89 行，如实汇报留痕自测
+    ├── test_crossref_gate.py                    #  45 行，备用源门禁自测
+    ├── test_venue_rules.py                      #  43 行，会议识别自测
     └── test-cases/                              # 8 个用例说明
 ```
 
-合计 30 个文件、315 KB，其中 Python 4083 行、Markdown 1775 行。
+合计 35 个文件、394 KB，其中 Python 5748 行、Markdown 2784 行。
 `AGENTS.md` 与 `references/` 是长文档，`SKILL.md` 只在需要精确细节时指向它们，这样触发成本才可控。
 
 ---
@@ -386,12 +390,12 @@ literature-search/
 
 ### 四、分区数据的固有缺陷
 
-分区来自 journalmetrics.org，**收录不全**。`filter_papers()` 会**放行**分区未知的论文；
-若要"只要 Q1/Q2"，必须自行改为严格过滤，并主动说明：
-被丢弃的 `unknown` 里可能包含本属 Q1/Q2 的期刊。
+分区来自 LetPub 的中科院《新锐期刊分区表》，**收录不全**。`filter_papers()` 会**放行**未收录的论文；
+若要"只要 1/2 区"，必须自行改为严格过滤，并主动说明：
+被丢弃的 `未收录` 里可能包含本属 1/2 区的期刊。
 
-⚠️ **v2.0 之前的分区缓存不可信**：旧实现靠网页 `<title>` 正则解析，实测把一个 Q1 期刊记成了 Q2。
-缓存版本号已升到 v2，**v1 旧缓存一律视为失效**；必要时用 `--enrich-quartile --refresh` 重查。
+⚠️ **v2.0 之前的分区缓存不可信**：旧实现靠网页 `<title>` 正则解析，实测把一本 1 区期刊记成了 2 区。
+缓存版本号已升到 v2，**v1 旧缓存一律视为失效**；必要时用 `--enrich-zone --refresh` 重查。
 
 ### 五、如实汇报（最高优先级）
 
@@ -413,7 +417,7 @@ literature-search/
 - **输出目录默认是 `./litsearch_output`**，用 `LITSEARCH_OUT_DIR` 或 `save_dir=` 覆盖；
 - **`.quartile_cache.json` 不在仓库里**，首次跑分区查询会慢（每种期刊 6–8 秒）；
 - **结构化筛选前会校验字段**：列不存在、或**列存在但整列为空**都会**直接报错退出**，
-  后者是最危险的静默失败（实测"只要 Q1"曾把 565 篇静默全部排除，看起来像"该领域没有 Q1 论文"）；
+  后者是最危险的静默失败（实测"只要 1 区"曾把 565 篇静默全部排除，看起来像"该领域没有 1 区论文"）；
 - **`PaperID` / `DOI` 列强制文本格式**，否则 Excel 会把长 ID 显示成科学计数法，Phase 2 会整批查不到；
 - **xlsx 只是视图，json 仍是权威源**。
 
@@ -423,7 +427,7 @@ literature-search/
 
 1. **主数据源单一**：主力是 Semantic Scholar。备用源 Crossref **只能检索到有 DOI 的文献**，
    无 DOI 的会议论文、区域性期刊、技术报告、标准等一律检索不到，存在**系统性覆盖缺口**。
-2. **分区数据不完整**：journalmetrics.org 未收录的期刊分区为 `unknown`。
+2. **分区数据不完整**：LetPub 未收录的期刊标记为 `未收录`。
 3. **首次 BGE 加载约 100 秒**（CPU），且内存只有进程退出才归还。
 4. **`evals/test-cases/` 下的部分用例描述早于当前架构**
    （例如仍写"默认 limit=50"、"用 Semantic Scholar batch API 取摘要"），与现行流程不一致，仅作历史参考。
@@ -437,7 +441,7 @@ literature-search/
 
 | 项目 | 要求 |
 |---|---|
-| Python | 3.8+（开发与实测环境为 3.10；全仓无 3.9+ 专属语法） |
+| Python | 3.10+（开发与实测环境为 3.13） |
 | 第三方包（必备） | `requests`、`openpyxl`（元数据表读写） |
 | 第三方包（BGE 排序） | `numpy`、`sentence-transformers`、`torch`；缺失时**跳过排序**并降级，不算失败 |
 | 第三方包（可选） | `psutil`，仅 `bge_status.py` 用 |

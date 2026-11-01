@@ -22,6 +22,33 @@
   frontmatter 只有 `name` 和 `description` 两个字段，正是 Agent Skills 规范要求的全部，
   **格式本身不需要改**；要改的是安装位置、密钥来源和可选依赖。已改为指向 `INSTALL.md` 第七节。
 
+### 修复：清掉 v1.9 遗留的旧口径
+
+v2.0.0 改了口径，但文档只改了一半，同一份 `README.md` 里前后矛盾。本版统一。
+
+- **`README.md`**：「检索流程」与「快速开始」还在写每轮 200 篇（候选池 600、6–8 次请求），
+  实际是 500 篇（候选池 1500、15–20 次请求）；分区来源仍写 journalmetrics.org，实际是 LetPub；
+  `--quartile Q1`、`--enrich-quartile` 已改为 `--zone 1`、`--enrich-zone`；
+  「仓库结构」的文件数、行数是 v1.9 的，已按当前仓库重数（35 个文件、394 KB、Python 5748 行、Markdown 2784 行），
+  并补上 v2.0 新增的 `abstract_fill.py`、`venue_rules.py` 与两套自测。
+- **`SKILL.md`**：开头「一次检索 6–8 次 API 调用」与同文件后文的 15–20 次矛盾，已改；
+  排错表里 `--letpub --issn <ISSN>` 这个参数**根本不存在**，改成
+  `journal_quartile.letpub_zone(issn=...)`。
+- **`AGENTS.md`**：§2.1 架构图仍写「JCR 分区」；§2.2 模块职责表缺 `abstract_fill.py` 与 `venue_rules.py`；
+  §6 排错表仍写「分区大量 unknown」。均已改。
+- **`references/examples-and-details.md`**：6 处 JCR / Q1 / `quartile` 示例改为中科院 1–4 区口径。
+- **`evals/test-cases/bge-ranking.md`**：2 处同上。
+- **Python 版本**：`README.md` 兼容性表写 3.8+，`INSTALL.md` 写 3.10+，已统一为 **3.10+**（实测环境 3.13）。
+
+### 修复：会议论文集篇数口径
+
+「Italian National Conference on Sensors」在 `CHANGELOG.md` v2.0.0 段与 `AGENTS.md` §3.8 里
+都写作 **16 篇**，但按同一份 553 篇全池表用 `venue_rules.is_conference_venue()` 重新统计是 **41 篇**，
+其余五项（47 / 8 / 3 / 2 / 3）都能对上。已改为 41。
+
+顺带核实了一遍总数：该表按刊名判为会议 126 篇，其中 27 篇平台已标，**差额正是 99 篇**，
+与 v2.0.0 的说法一致；`126 − 27 = 99`，这条不用改。
+
 ### 已知不一致
 
 - 密钥来源三个脚本不统一：`semantic_scholar_search.py` 与 `translator.py` 会依次尝试
@@ -41,7 +68,7 @@
   Elsevier 通道无权限时仍返回 HTTP 200，判据看「有没有 `dc:description` 字段」而非状态码。
 - **会议论文集识别 `venue_rules.py`**：`publicationTypes` 挡不住会议论文集——实测 553 篇里
   标 `Conference` 的仅 27 篇，另有 **99 篇刊名明显是会议论文集**却标 `JournalArticle`
-  （e-Journal of NDT 47 篇、Italian National Conference on Sensors 16 篇等）。
+  （e-Journal of NDT 47 篇、Italian National Conference on Sensors 41 篇等）。
   按刊名规则判定，并带白名单避免误杀 `Proceedings of the Institution of ...` 这类正规期刊。
 - **`evals/test_abstract_fill.py`、`evals/test_venue_rules.py`**：两块新能力的自测。
 
