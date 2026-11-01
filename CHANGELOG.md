@@ -3,6 +3,32 @@
 本项目的版本号描述**检索行为与产出格式的变化**。每条都附了当初的实测依据 ——
 这个 skill 的绝大多数设计取舍来自实测踩坑，而不是先验推理。
 
+## v2.0.1
+
+**文档修订，检索行为无变化。目标是让不使用 DSH 的人也能装上并跑起来。**
+
+已安装 v2.0.0 并正常使用的 DSH 用户**不需要升级**。
+
+### 新增
+
+- `INSTALL.md` 新增第七节「装到 DSH 以外的 Agent」：装到哪里、Key 放哪、
+  `searchts` 这个可选外部命令缺了会怎样、`description` 的语言与长度上限、装完怎么自检。
+  并给出判断依据（Agent Skills 规范）与写法参考（`anthropics/skills` 里的 `skill-creator`）。
+- `README.md` 开头补一句指向该节。
+
+### 变更
+
+- `README.md` 原先写「安装到其他 Agent 时需要修改 skill 的触发条件」，这个说法不准确。
+  frontmatter 只有 `name` 和 `description` 两个字段，正是 Agent Skills 规范要求的全部，
+  **格式本身不需要改**；要改的是安装位置、密钥来源和可选依赖。已改为指向 `INSTALL.md` 第七节。
+
+### 已知不一致
+
+- 密钥来源三个脚本不统一：`semantic_scholar_search.py` 与 `translator.py` 会依次尝试
+  `~/.dsh/env.json`、`~/.claude/settings.json`、环境变量；`abstract_fill.py` 只认前两者中的
+  `~/.dsh/env.json` 和进程环境变量。跨宿主时**请统一使用环境变量**，这一条已写进 `INSTALL.md`。
+  代码本身未改动，留待后续版本统一。
+
 ## v2.0.0
 
 **分区口径重做，并补上摘要与会议论文集两块长期缺口。**

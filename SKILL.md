@@ -5,6 +5,8 @@ description: 学术文献检索（主源 Semantic Scholar）：3–4 轮 ≤5 �
 
 # 文献检索 Skill
 
+**版本 v2.0.1** · 遵循 Agent Skills 规范 · 宿主不是 DSH 时见 `INSTALL.md` 第七节
+
 主数据源 Semantic Scholar 的学术文献检索，**一次检索 6–8 次 API 调用**：
 3–4 轮关键词（每轮 ≤5 词，各取 500 篇）→ BGE 每组独立评分 → 主题闸门 → 落盘 Excel → 按需读取。
 

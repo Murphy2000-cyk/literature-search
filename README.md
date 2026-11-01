@@ -1,10 +1,10 @@
 # literature-search
 
-`literature-search` 是用于文献检索的 skill，以 **Semantic Scholar** 为主数据源。通过内置的 BGE 模型对数据进行筛选和排序，根据用户需求返回学术文献。大模型只会接收到「检索、筛选、排序」后的最终数据，因此极大程度地节约了 token 消耗。当前版本 **v2.0.0**，默认使用 DSH 的 skill 格式；安装到其他 Agent 时需要修改 skill 的触发条件。
+`literature-search` 是用于文献检索的 skill，以 **Semantic Scholar** 为主数据源。通过内置的 BGE 模型对数据进行筛选和排序，根据用户需求返回学术文献。大模型只会接收到「检索、筛选、排序」后的最终数据，因此极大程度地节约了 token 消耗。当前版本 **v2.0.1**。`SKILL.md` 遵循 **Agent Skills** 规范，frontmatter 只有 `name` 和 `description` 两个字段，所以**文件格式本身不需要改**就能装到 DSH 以外的宿主；要调整的是装到哪里、Key 放哪、以及一个可选的外部命令，见 [INSTALL.md 第七节](INSTALL.md#七装到-dsh-以外的-agent)。
 
 **English**
 
-`literature-search` is a literature-retrieval skill for **DeepSeek Harness (DSH)**. It searches academic literature on **Semantic Scholar** as its primary data source, then uses a built-in BGE model to score and rank the candidates and filters them by a topic gate plus the user's requirements, so the model only ever receives the final retrieved, filtered and ranked data. That saves a large amount of tokens. Current version: **v2.0.0**. It ships in DSH's skill format, so installing it into another agent requires editing the skill's trigger conditions.
+`literature-search` is a literature-retrieval skill for **DeepSeek Harness (DSH)**. It searches academic literature on **Semantic Scholar** as its primary data source, then uses a built-in BGE model to score and rank the candidates and filters them by a topic gate plus the user's requirements, so the model only ever receives the final retrieved, filtered and ranked data. That saves a large amount of tokens. Current version: **v2.0.1**. Its `SKILL.md` follows the **Agent Skills** spec (the frontmatter carries only `name` and `description`), so the file format itself needs no change to run on hosts other than DSH. What does need adjusting is where to install it, where the API keys live, and one optional external command; see section 7 of [INSTALL.md](INSTALL.md).
 
 ---
 
