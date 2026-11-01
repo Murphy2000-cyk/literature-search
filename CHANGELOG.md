@@ -53,7 +53,7 @@ v2.0.0 改了口径，但文档只改了一半，同一份 `README.md` 里前后
 
 - 密钥来源三个脚本不统一：`semantic_scholar_search.py` 与 `translator.py` 会依次尝试
   `~/.dsh/env.json`、`~/.claude/settings.json`、环境变量；`abstract_fill.py` 只认前两者中的
-  `~/.dsh/env.json` 和进程环境变量。跨宿主时**请统一使用环境变量**，这一条已写进 `INSTALL.md`。
+  `~/.dsh/env.json` 和进程环境变量。跨智能体（Agent）时**请统一使用环境变量**，这一条已写进 `INSTALL.md`。
   代码本身未改动，留待后续版本统一。
 
 ## v2.0.0

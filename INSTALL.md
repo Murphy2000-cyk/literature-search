@@ -21,7 +21,7 @@
 
 ## 二、装到哪里
 
-> **如果你用的不是 DSH**（Claude Code、或任何支持 Agent Skills 的宿主），直接跳到
+> **如果你用的不是 DSH**（Claude Code、或任何支持 Agent Skills 的智能体（Agent）），直接跳到
 > **[第七节](#七装到-dsh-以外的-agent)**。那里讲装到哪里、Key 放哪、哪些能力依赖外部命令。
 > 本节的路径是 DSH 的惯例位置，不是通用要求。
 
@@ -169,23 +169,23 @@ Key 本身不含内容权限。在校内网重跑一次补摘要即可。
 形态是固定的：
 
 ```
-<你的宿主的 skill 扫描根>/literature-search/SKILL.md
+<你的智能体的 skill 扫描根>/literature-search/SKILL.md
 ```
 
 **不要多套一层文件夹。** 写成 `<扫描根>/literature-search/literature-search/SKILL.md`
-不会被识别，而且多数宿主**不报错**，表现成「装了但用不了」，很难查。
+不会被识别，而且多数智能体**不报错**，表现成「装了但用不了」，很难查。
 
 装完这个目录里应当能直接看到 `SKILL.md`、`search_pipeline.py` 等文件。
 
-| 宿主 | 放到 |
+| 智能体 | 放到 |
 |---|---|
-| DSH（本仓库的原生宿主） | `~/.agents/skills/` 或 `~/.dsh/skills/` |
+| DSH（本仓库的原生智能体） | `~/.agents/skills/` 或 `~/.dsh/skills/` |
 | Claude Code | `~/.claude/skills/literature-search/` |
-| 其他宿主 | 按它的文档找到 skills 目录，形态同上 |
+| 其他智能体 | 按它的文档找到 skills 目录，形态同上 |
 
-深度是一层，这一点各宿主基本一致。装完记得重新加载，或重启一次会话。
+深度是一层，这一点各智能体基本一致。装完记得重新加载，或重启一次会话。
 
-### 2. Key 放哪：跨宿主请统一用环境变量
+### 2. Key 放哪：跨智能体请统一用环境变量
 
 默认读 `~/.dsh/env.json`，那是 DSH 的约定。**不是 DSH 的话，用环境变量最省事**，三个脚本都认：
 
@@ -204,7 +204,7 @@ Windows 用 `setx SEMANTIC_SCHOLAR_API_KEY "s2k-..."`，改完要重开终端才
 | `translator.py` | 同上 |
 | `abstract_fill.py` | **只有** `~/.dsh/env.json` 和进程环境变量 |
 
-所以跨宿主时，**环境变量是唯一三个脚本都认的方式**。
+所以跨智能体时，**环境变量是唯一三个脚本都认的方式**。
 
 ### 3. 一个可选的外部命令：`searchts`
 
@@ -226,9 +226,9 @@ Windows 用 `setx SEMANTIC_SCHOLAR_API_KEY "s2k-..."`，改完要重开终端才
 `description` 目前是中文写的。如果你的模型主要用英文对话，它可能匹配不上。两种做法：
 
 - 改成英文，或中英并列；
-- 不改，用你的宿主提供的方式手动调用。
+- 不改，用你的智能体提供的方式手动调用。
 
-两个宿主对 `description` 的长度上限不同：DSH 这边按 400 字符算，Agent Skills 规范给 1024。
+两个智能体对 `description` 的长度上限不同：DSH 这边按 400 字符算，Agent Skills 规范给 1024。
 当前版本两百来字，两边都够，不用动。
 
 ### 5. 平台与路径
@@ -255,7 +255,7 @@ Windows 用 `setx SEMANTIC_SCHOLAR_API_KEY "s2k-..."`，改完要重开终端才
 - **写法参考**：`https://github.com/anthropics/skills` 里的 `skills/skill-creator`
 - **最小模板**：同一个仓库的 `template/`
 
-`skill-creator` 是教你怎么写一个 skill 的；**规范才是判断「我这个 skill 在别的宿主上能不能跑」的依据**，
+`skill-creator` 是教你怎么写一个 skill 的；**规范才是判断「我这个 skill 在别的智能体上能不能跑」的依据**，
 两者不要混用。
 
 ---

@@ -5,7 +5,7 @@ description: 学术文献检索（主源 Semantic Scholar）：3–4 轮 ≤5 �
 
 # 文献检索 Skill
 
-**版本 v2.0.1** · 遵循 Agent Skills 规范 · 宿主不是 DSH 时见 `INSTALL.md` 第七节
+**版本 v2.0.1** · 遵循 Agent Skills 规范 · 所用智能体（Agent）不是 DSH 时见 `INSTALL.md` 第七节
 
 主数据源 Semantic Scholar 的学术文献检索，**一次检索 15–20 次 API 调用**：
 3–4 轮关键词（每轮 ≤5 词，各取 500 篇）→ BGE 每组独立评分 → 主题闸门 → 落盘 Excel → 按需读取。
@@ -37,7 +37,7 @@ description: 学术文献检索（主源 Semantic Scholar）：3–4 轮 ≤5 �
 
 ```python
 import sys
-SKILL_DIR = r"<技能资源基底>"   # 取宿主给出的 Base directory，不要写死绝对路径
+SKILL_DIR = r"<技能资源基底>"   # 取智能体给出的 Base directory，不要写死绝对路径
 sys.path.insert(0, SKILL_DIR)
 from semantic_scholar_search import SemanticScholarSearcher, ApiUnavailableError
 
@@ -173,4 +173,4 @@ rep = searcher.search_report()       # 结构化数据，写入调研日志
 | `AGENTS.md` §3.6 | **论文元数据表**（Excel 落盘 + 按需读取）的完整用法与三条硬约束 |
 | `references/examples-and-details.md` | 产出文件格式（初筛 / 筛选结果 / JSON）、4 个使用示例、API Key 申请、速率限制、BGE 排序原理、paper_id 与 DOI 索引用法 |
 
-脚本都在本 skill 目录下。引用时按宿主给出的**技能资源基底**解析相对路径，不要写死绝对路径（技能可能来自远程来源）。
+脚本都在本 skill 目录下。引用时按智能体给出的**技能资源基底**解析相对路径，不要写死绝对路径（技能可能来自远程来源）。
