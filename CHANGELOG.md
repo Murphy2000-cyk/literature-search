@@ -3,6 +3,106 @@
 本项目的版本号描述**检索行为与产出格式的变化**。每条都附了当初的实测依据 ——
 这个 skill 的绝大多数设计取舍来自实测踩坑，而不是先验推理。
 
+## v2.2.0
+
+架构性重写。**凡与 v2.1.x 及更早描述冲突处，以本版本为准。**
+
+### 新增
+
+- **六环节流水线**（`search_pipeline.run()`）：原始检索 → 去重 → 近 N 年 → 记录合规 →
+  期刊等级 → 排序。每环节落一份 Excel，另出 `筛选过程记录.md` 与 `筛选淘汰记录.xlsx`。
+- **`keyword_fetch.py`**：OpenAlex 按 DOI 批量（50 一批）一次取回 `keywords` 与
+  `abstract_inverted_index`。S2 没有 `keywords` 字段（请求返回 400），
+  `fieldsOfStudy` 只有粗学科，不能当关键词用。
+- **`relevance_scorer.rank_topic()`**：用一句主题描述整句编码打分，
+  标题 0.6 + 关键词 0.4，摘要不参与。取代「拆词求均值 + 跨组取最大」。
+- **`assert_fields_cover()`**：字段存在性断言。只校验键是否存在，不校验值是否为空。
+- **`year_window()`**：近 N 年的精确到日下界，只设下界不设上界；年份缺失的行保留并标注。
+- 新增列：发表日期、ISSN、关键词、分区依据、分区状态、摘要来源、是否撤稿、
+  版面元素、记录可疑、命中轮次、命中轮数、年份判定依据、淘汰环节、淘汰原因。
+
+### 变更
+
+- **刊名三级回退**：`journal.name` → `publicationVenue.name` → `venue`，
+  **只在 S2 响应内部回退**。旧版只请求 `venue`，而真正装刊名的是 `journal`。
+- **分区默认标准改为 JCR 1 区**（`--zone-basis jcr`），可切 `xr`（中科院新锐）。
+- **摘要补全改为四档**：S2 → OpenAlex → Elsevier → PubMed；
+  其中 OpenAlex 与取关键词共用同一次请求，零额外成本。
+- 检索阶段**不设年份限制**，改成第 3 环节本地筛，保留全量原始数据。
+
+### 移除
+
+- 主题闸门不再接入流水线（`topic_gate.py` 与 `gate_profiles.json` 文件保留）。
+- Crossref 反查刊名、Crossref 反查 ISSN、`.issn_cache.json`。
+- `abstract_fill.py` 的 Crossref 与网页渲染两档。
+- `relevance_scorer.rank_groups()` 标为不推荐，保留兼容。
+
+### 修复
+
+- **Windows 控制台 GBK 崩溃**：`paper_table.py` 等 10 个脚本打印中文时报
+  `UnicodeEncodeError: 'gbk' codec can't encode character`。已在 `import sys` 后统一加
+  `sys.stdout/stderr.reconfigure(encoding="utf-8")`，新增脚本必须照做。
+- **`.gitignore` 漏项（v2.1.0 遗留）**：v2.1.0 的条目声称 `data/journal_zone.xlsx` 已加入
+  `.gitignore`，但仓库里实际只写了已废弃的 `.quartile_cache.json`。已补 `data/` 与
+  `.letpub_zone_cache.json` 两行，并在文件内注明修正来源，避免 719 行累积分区库被误提交。
+
+### 新增领域设定
+
+- **`--domain cs`**：计算机领域**默认放行单篇会议论文**。计算机以顶会为主要发表渠道，
+  用「只要期刊论文」的口径会把该领域主体文献整个排除（本次实测某 CS 题目 878 篇里
+  705 篇属会议或预印本）。其它领域仍默认排除。
+- `--allow-preprint` 单独控制预印本，**不随领域自动开**。
+- 会议录卷级条目与撤稿**永远剔除**，不受任何开关影响。
+- `check_query_ambiguity()`：查询含 `agent`、`long-term memory`、`working memory` 等
+  多义词时打提示（只提示，不改查询、不删结果）。
+- 失败时记录失败端点（`searcher.last_failed_endpoint`）并写进异常消息。
+  限流按端点施加，一个端点 429 不代表另一个也不可用。
+
+### 保留
+
+- Crossref **备用检索源**（`crossref_fallback.py`）保留。门禁不变：未获用户同意不发任何请求。
+  同意提示**必须同时说明其缺失**：只能检索到有 DOI 的文献、摘要覆盖低、
+  只返回相关性前 N 条、覆盖偏向有 DOI 的英文期刊。
+
+### 文档
+
+- `SKILL.md` 重写；`AGENTS.md` 新增 §0「现行架构」并声明其优先级高于后续历史章节；
+  新增 `references/实测记录.md` 集中存放实测数字（正文不再写具体百分比与篇数）。
+- 新增 `references/easyscholar-api.md`（分区接口的字段陷阱与调试清单）与
+  `references/journal-name-issues.md`（刊名匹配不上时的规范化规则）。
+- `README.md` 的「功能」「模块一览」「检索流程」「仓库结构」四处按 v2.2.0 重写：
+  补 `keyword_fetch.py`、补三份 references 文件、行数改为实际统计（39 个文件 / 7215 行 Python）。
+- `INSTALL.md` 依赖清单补 `psutil`（`bge_status.py` 必需），并把 `curl_cffi` 从本仓库依赖改为
+  `searchts` 侧的要求；分区查询说明由「LetPub + searchts」改为「easyScholar 接口优先」。
+- 发布前清理：文档与脚本里的本机绝对路径（个人目录、conda 路径、内部归档目录）统一改为占位符。
+
+## v2.1.0
+
+**分区数据改成固定落盘的 Excel 表，带查询日期，可按需更新。**
+
+### 新增
+
+- **`data/journal_zone.xlsx` 作为分区数据权威源**，五列：期刊名 / ISSN / 分区 / 状态 / 查询日期（`YYYY-MM-DD`）。
+  状态三值：`已收录` / `未收录` / `查询失败`。
+- 每查到一本刊就写一行，日期记当天；下次遇到同一本刊直接命中，不再联网。
+- 有效期：`已收录` **60 天**，`未收录` 30 天，`查询失败` 一律重试。判断是**惰性**的，
+  只对本次检索实际用到的那几本刊判断新不新；表里其他过期行不会被无端重查。
+- `python journal_quartile.py --stats` 看总量与各状态计数。
+- `python paper_table.py --enrich-zone --refresh` 全量更新。
+
+### 变更
+
+- 缓存位置从代码目录的点号 JSON 改为 skill 内固定的 `data/journal_zone.xlsx`，用户可直接打开看与手改；
+  旧 `.letpub_zone_cache.json` 首次运行自动迁移进来。
+- 批量查询改为整批只写一次盘，避免逐本读写 Excel。
+- `data/journal_zone.xlsx` 加入 `.gitignore`，属本地资产，不随仓库分发。
+
+### 修复
+
+- 摘要里的非法控制字符（如 `\x0b`）会让 `save_papers_xlsx` 抛 `IllegalCharacterError`、整份文件不生成。
+  现已在写入前过滤。
+
+---
 ## v2.0.1
 
 **文档修订，检索行为无变化。目标是让不使用 DSH 的人也能装上并跑起来。**
@@ -22,9 +122,9 @@
   frontmatter 只有 `name` 和 `description` 两个字段，正是 Agent Skills 规范要求的全部，
   **格式本身不需要改**；要改的是安装位置、密钥来源和可选依赖。已改为指向 `INSTALL.md` 第七节。
 
-### 修复：清掉 v1.9 遗留的旧口径
+### 修复：清掉 v1.9 遗留的旧标准
 
-v2.0.0 改了口径，但文档只改了一半，同一份 `README.md` 里前后矛盾。本版统一。
+v2.0.0 改了标准，但文档只改了一半，同一份 `README.md` 里前后矛盾。本版统一。
 
 - **`README.md`**：「检索流程」与「快速开始」还在写每轮 200 篇（候选池 600、6–8 次请求），
   实际是 500 篇（候选池 1500、15–20 次请求）；分区来源仍写 journalmetrics.org，实际是 LetPub；
@@ -36,11 +136,11 @@ v2.0.0 改了口径，但文档只改了一半，同一份 `README.md` 里前后
   `journal_quartile.letpub_zone(issn=...)`。
 - **`AGENTS.md`**：§2.1 架构图仍写「JCR 分区」；§2.2 模块职责表缺 `abstract_fill.py` 与 `venue_rules.py`；
   §6 排错表仍写「分区大量 unknown」。均已改。
-- **`references/examples-and-details.md`**：6 处 JCR / Q1 / `quartile` 示例改为中科院 1–4 区口径。
+- **`references/examples-and-details.md`**：6 处 JCR / Q1 / `quartile` 示例改为中科院 1–4 区标准。
 - **`evals/test-cases/bge-ranking.md`**：2 处同上。
 - **Python 版本**：`README.md` 兼容性表写 3.8+，`INSTALL.md` 写 3.10+，已统一为 **3.10+**（实测环境 3.13）。
 
-### 修复：会议论文集篇数口径
+### 修复：会议论文集篇数标准
 
 「Italian National Conference on Sensors」在 `CHANGELOG.md` v2.0.0 段与 `AGENTS.md` §3.8 里
 都写作 **16 篇**，但按同一份 553 篇全池表用 `venue_rules.is_conference_venue()` 重新统计是 **41 篇**，
@@ -58,7 +158,7 @@ v2.0.0 改了口径，但文档只改了一半，同一份 `README.md` 里前后
 
 ## v2.0.0
 
-**分区口径重做，并补上摘要与会议论文集两块长期缺口。**
+**分区标准重做，并补上摘要与会议论文集两块长期缺口。**
 
 ### 新增
 

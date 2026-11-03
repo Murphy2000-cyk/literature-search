@@ -1,28 +1,33 @@
 # -*- coding: utf-8 -*-
-"""摘要补全：多源降级，补齐元数据表里缺摘要的行
+"""摘要补全：Elsevier → PubMed 两档（OpenAlex 由 keyword_fetch 一并处理）
 
-为什么要这个模块（2026-10-30 实测）
-----------------------------------
-Semantic Scholar 的检索响应自带摘要，但**覆盖率约 84%**，缺的那部分几乎全是 Elsevier：
-Elsevier 自 2019 年起不向 Crossref / OpenAlex / Semantic Scholar 等第三方元数据平台
-提供摘要。实测一批 65 篇的调研里缺 13 篇，其中 10 篇是 Elsevier、1 篇 IEEE、1 篇 T&F、
-1 篇 Springer。手工逐个找源把覆盖率从 80% 提到 98%，本模块就是把那个过程固化下来。
+为什么要这个模块
+----------------
+Semantic Scholar 的检索响应自带摘要，但覆盖率随语料而变，缺的那部分里
+Elsevier 居多：它自 2019 年起不向 Crossref / OpenAlex / Semantic Scholar
+等第三方元数据平台提供摘要。
 
-降级顺序（每一档都实测过）
---------------------------
-1. **Crossref**：只对非 Elsevier 有效；Elsevier 一律无摘要。
-2. **OpenAlex**：`abstract_inverted_index` 有时有、Elsevier 大多为空；有则按位置还原。
-3. **Elsevier API**：唯一能拿到 Elsevier 摘要的通道，需要
+三档顺序与各自的定位
+--------------------
+1. **Elsevier API**：唯一能拿到 Elsevier 摘要的通道。需要
    - API key（<https://dev.elsevier.com> 注册 → Create API Key）
    - 机构订阅 ScienceDirect 或 Scopus
    - **调用时出口 IP 属于该机构**（授权按 IP，不按 key）
    端点 `api.elsevier.com/content/abstract/doi/{DOI}`，取
    `abstracts-retrieval-response.coredata."dc:description"`。
-   ⚠️ **无权限时仍返回 HTTP 200**，只是没有 `dc:description` 字段（只剩 9 个标识符），
-   所以判据必须是"有没有这个字段"，不能看状态码。
-4. **PubMed**（按 DOI 反查 PMID）：IEEE 等被 PubMed 收录的刊物常有完整摘要。
-5. **searchts 渲染出版商页面**：Springer、T&F 实测有效（T&F 能绕开 Cloudflare）；
-   ScienceDirect 网页会被拦（403），不要指望它。
+   ⚠️ **无权限时仍返回 HTTP 200**，只是没有 `dc:description` 字段，
+   所以判据必须是「有没有这个字段」，不能看状态码。
+
+2. **OpenAlex**：不在本模块里。它按 DOI 批量查询时顺带返回
+   `abstract_inverted_index`，与「取关键词」是同一次请求，因此并入
+   `keyword_fetch.py`，成本为零。
+
+3. **PubMed**（按 DOI 反查 PMID）：走 DOI 的最后一档。它只在生物医学
+   类刊物上有覆盖，工程类文献大多查不到，所以放在最后。
+
+本模块**不覆盖**的：Crossref（对 Elsevier 无摘要、对其它出版商命中率也很低）
+与网页渲染（需 searchts 空跑 20~50 秒，成本最高、覆盖最窄）。这两档已删除，
+不要再加回来。
 
 key 的存放
 ----------
@@ -43,7 +48,8 @@ import re
 import sys
 import time
 
-SOURCES = ("crossref", "openalex", "elsevier", "pubmed", "searchts")
+# 顺序即优先级。OpenAlex 不在此列，见 keyword_fetch.py
+SOURCES = ("elsevier", "pubmed")
 MAILTO = "dsh-litsearch@example.com"
 UA = f"DSH-litsearch/1.0 (mailto:{MAILTO})"
 
@@ -77,36 +83,6 @@ def _is_elsevier(doi):
 
 
 # ---------------------------------------------------------------- 各源
-
-def from_crossref(doi, timeout=25):
-    import requests
-    r = requests.get(f"https://api.crossref.org/works/{doi}",
-                     params={"mailto": MAILTO}, timeout=timeout,
-                     headers={"User-Agent": UA})
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code}"
-    ab = _clean(r.json().get("message", {}).get("abstract"))
-    return (ab or None), ("命中" if ab else "无摘要字段")
-
-
-def from_openalex(doi, timeout=25):
-    """OpenAlex 的摘要是倒排索引，需要按位置还原。"""
-    import requests
-    r = requests.get(f"https://api.openalex.org/works/doi:{doi}",
-                     params={"mailto": MAILTO}, timeout=timeout,
-                     headers={"User-Agent": UA})
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code}"
-    inv = r.json().get("abstract_inverted_index")
-    if not inv:
-        return None, "abstract_inverted_index 为空"
-    pos = {}
-    for word, idxs in inv.items():
-        for i in idxs:
-            pos[i] = word
-    ab = " ".join(pos[i] for i in sorted(pos))
-    return (ab or None), ("命中" if ab else "还原后为空")
-
 
 def from_elsevier(doi, key, timeout=40):
     import requests
@@ -154,43 +130,6 @@ def from_pubmed(doi, timeout=25):
         return None, f"异常 {type(e).__name__}"
 
 
-def from_searchts(doi, timeout=120):
-    """用 searchts 渲染 DOI 落地页并抽摘要段落。ScienceDirect 会 403。"""
-    import subprocess
-    try:
-        r = subprocess.run(["searchts", "read", f"https://doi.org/{doi}"],
-                           capture_output=True, encoding="utf-8",
-                           errors="replace", timeout=timeout)
-    except FileNotFoundError:
-        return None, "找不到 searchts"
-    except Exception as e:
-        return None, f"异常 {type(e).__name__}"
-    if r.returncode != 0 or not (r.stdout or "").strip():
-        return None, "页面抓取失败"
-    lines = (r.stdout or "").splitlines()
-    start = None
-    for i, ln in enumerate(lines):
-        s = ln.strip()
-        if re.match(r"^#+\s*abstract", s, re.I) or re.match(r"^\*\*abstract\*\*", s, re.I):
-            start = i
-            break
-    if start is None:
-        return None, "页面里没有 Abstract 段落"
-    buf = []
-    for ln in lines[start + 1:]:
-        s = ln.strip()
-        if s.startswith("#") or re.match(r"^(keywords?|key\s*words)", s, re.I):
-            break
-        if s.startswith("*  ["):        # 关键词链接行
-            break
-        if s:
-            buf.append(s)
-    ab = _clean(" ".join(buf))
-    if len(ab) < 80:                    # 太短多半是页面壳
-        return None, "摘要段落过短（疑似壳页）"
-    return ab, "命中"
-
-
 # ---------------------------------------------------------------- 主流程
 
 def fill_one(doi_or_title, key="", sources=SOURCES, sleep=0.2):
@@ -201,24 +140,18 @@ def fill_one(doi_or_title, key="", sources=SOURCES, sleep=0.2):
         return None, "", ["没有 DOI"]
     for src in sources:
         try:
-            if src == "crossref":
-                if _is_elsevier(doi):
-                    log.append("crossref: 跳过（Elsevier 不给 Crossref 摘要）")
-                    continue
-                ab, why = from_crossref(doi)
-            elif src == "openalex":
-                ab, why = from_openalex(doi)
-            elif src == "elsevier":
+            if src == "elsevier":
                 if not _is_elsevier(doi):
                     log.append("elsevier: 跳过（非 Elsevier 论文）")
                     continue
                 ab, why = from_elsevier(doi, key)
             elif src == "pubmed":
                 ab, why = from_pubmed(doi)
-            elif src == "searchts":
-                ab, why = from_searchts(doi)
+            elif src == "openalex":
+                log.append("openalex: 已并入 keyword_fetch 批量通道，此处跳过")
+                continue
             else:
-                ab, why = None, "未知来源"
+                ab, why = None, f"未知来源 {src}"
         except Exception as e:
             ab, why = None, f"异常 {type(e).__name__}"
         log.append(f"{src}: {why}")
@@ -278,12 +211,12 @@ def fill_table(path, out_path=None, refresh=False, limit=0,
             ws.cell(row=r, column=s_idx).value = src
             by_source[src] = by_source.get(src, 0) + 1
             if verbose:
-                print(f"  [{i}/{len(rows)}] ✓ {src:<9} {len(ab):>5} 字 | {title}")
+                print(f"  [{i}/{len(rows)}] OK {src:<9} {len(ab):>5} 字 | {title}")
         else:
             ws.cell(row=r, column=s_idx).value = "未补到"
             failed.append({"row": r, "doi": doi, "title": title, "log": log})
             if verbose:
-                print(f"  [{i}/{len(rows)}] ✗ {'; '.join(log)} | {title}")
+                print(f"  [{i}/{len(rows)}] MISS {'; '.join(log)} | {title}")
         time.sleep(0.2)
 
     dest = out_path or path
@@ -309,7 +242,7 @@ def fill_table(path, out_path=None, refresh=False, limit=0,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="摘要补全：Crossref → OpenAlex → Elsevier → PubMed → searchts 渲染")
+        description="摘要补全：Elsevier → PubMed（OpenAlex 见 keyword_fetch.py）")
     ap.add_argument("xlsx", help="元数据表路径")
     ap.add_argument("--out", help="另存到新文件（默认就地更新）")
     ap.add_argument("--refresh", action="store_true", help="连已有摘要的也重取")

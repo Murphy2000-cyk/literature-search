@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """abstract_fill 自测（全离线，不联网）
 
 覆盖：

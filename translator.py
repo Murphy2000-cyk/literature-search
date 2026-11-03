@@ -16,6 +16,13 @@ import os
 import json
 import time
 import sys
+# 控制台编码兜底：Windows 默认 GBK，打印中文/特殊字符会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 from typing import List, Optional
 
 import requests

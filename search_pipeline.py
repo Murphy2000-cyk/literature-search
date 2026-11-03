@@ -1,341 +1,714 @@
 # -*- coding: utf-8 -*-
-"""文献检索一步流程：检索 → BGE 每组独立评分 → 合并排序 → 落盘 Excel
+"""六环节检索流水线：检索 → 去重 → 近N年 → 记录合规 → 期刊等级 → 排序
 
-为什么要有这个模块
-------------------
-**内存生命周期是这里最重要的约束。**
-
-实测（2026-09-13，`bge-base-en-v1.5`，Windows/CPU）：
-
-| 状态 | 进程内存 |
-|---|---|
-| 什么都没加载 | 30 MB |
-| `import torch` + `sentence_transformers` | **732 MB** |
-| 再加载英文模型 | 865 MB |
-| `del` 引用 + `gc.collect()` | 858 MB（**只还了 7 MB**）|
-| 清 transformers 内部缓存 | 858 MB（无变化）|
-| Windows `SetProcessWorkingSetSize` 修剪 | 1 MB（**假象**：再分配内存后回到 250 MB）|
-
-**结论：进程内无法把 torch 占的内存真正还给操作系统，只有进程退出才能全部释放。**
-
-因此本模块的设计是：
-- **一次调用做完整个检索任务**（检索 → 评分 → 排序 → 落盘），
-  BGE 只加载一次、**整个任务期间持续激活、不重复加载**；
-- 调用返回后**请让进程结束** —— 内存随进程退出全部归还。
-- 不要在长期存活的进程里反复调用本模块再指望 `unload()` 释放内存。
+设计要点
+--------
+1. **每个环节落一份 Excel**，行数递减，便于逐级核对。
+2. **每个环节记录淘汰原因**，写进 `筛选淘汰记录.xlsx` 与 `筛选过程记录.md`。
+   禁止静默丢行：静默丢行会让人误以为「该领域没文献」。
+3. **顺序不可随意调**：
+   - 检索阶段**不设年份**，保留全量原始数据，改 N 只改参数、不重花配额；
+   - 去重必须在最前（身份层操作），否则后面每环节计数被重复记录污染；
+   - 年份与记录合规都是本地免费操作，放在分区查询之前；
+   - 分区查询最贵（easyScholar 限 2 次/秒，按 1 秒 1 次串行），必须最后做；
+   - 摘要补全放在排序与截取之后，Elsevier / PubMed 调用量只跟最终篇数有关。
+4. **筛选只对「有数据可判」的记录做判断**：缺字段的直接排除，原因类型记
+   `无数据可判`，与 `不符合条件` 分开统计。摘要非硬性，能拿多少算多少。
 
 用法
 ----
-**标准检索（用户 2026-09-20 指定、10-30 调参）：3~4 轮关键词，每轮 ≤5 词，各取 500 篇（5 页）。**
+    python search_pipeline.py --out <目录> --topic "one sentence in English" \\
+        "query one" "query two" "query three" "query four"
 
-    python search_pipeline.py --out <目录> \
-        "external wall insulation non-destructive testing" \
-        "infrared thermography facade insulation debonding" \
-        "ground penetrating radar insulation bonding" \
-        "insulation layer defect ultrasonic detection"
-
-或编程调用：
-
-    from search_pipeline import run
-    res = run(QUERIES, OUT)          # 默认 每轮500篇（5页）/ 入表不截断
-    print(res["api_calls"], res["rounds"])
-
-**不做探针轮** —— 轮的"微调变体"本身就承担试探作用。
-关键词超 5 个或轮数不在 3~4 之间会**直接报错**（`--loose` 可降级为警告）。
-
-API 调用预算：3~4 轮 × 2 页 = **6~8 次请求**（+ 少量 429 重试）。
-检索响应已直接带回 DOI / 摘要 / OA 链接，**不需要再跑 Phase 2 补详情**。
-
-知识库的常驻服务（端口 8767）用的是**中文**分支、在**它自己的进程**里，
-和本模块用的英文分支互不影响；本模块所在进程退出后内存即归还。
-
-⚠️ 澄清一个容易产生的误解：「关掉 torch」不会影响别的程序
---------------------------------------------------------
-**torch 不是全局开关，而是每个 Python 进程各自 import 的一份库。**
-本模块所在进程退出时，操作系统只回收**这个进程**的内存，
-**不会触碰**知识库常驻服务那个进程里的 torch 与中文模型。
-
-2026-09-13 实测（三次快照）：
-
-```
-实验前 : 端口 8767 监听中，PID=25604，832 MB；查询正常（命中 5，返回 9 条）
-实验中 : PID 14992  865 MB   ← 本模块进程（英文 BGE）
-         PID 25604  832 MB   ← 知识库常驻服务（中文 BGE）  ← 两个独立进程
-实验后 : 端口 8767 仍监听中，PID 仍是 25604（未被重启），832 MB；查询结果完全一致
-```
-
-**两个 PID、两份 torch、两份模型，各自独立。** 停掉一边对另一边零影响。
-
-**但内存总量确实会叠加**（这才是真正需要留意的）：
-
-| | 常驻 | 跑论文检索时 |
-|---|---|---|
-| 知识库常驻服务（中文 BGE） | 832 MB | 832 MB |
-| 论文检索进程（英文 BGE） | 0 | 865 ~ 1260 MB |
-| **合计** | 832 MB | **约 1.7 ~ 2.1 GB** |
-
-若跑论文检索时想腾出内存，可临时停掉知识库常驻服务
-（`python search_reflect.py --stop-daemon`，释放约 825 MB），
-下次用知识库检索时它会**自动拉起**，无需手动重启。
+    python search_pipeline.py --out <目录> --topic "..." --years 5 \\
+        --zone 1,2 --zone-basis xr --top 100 "q1" "q2" "q3" "q4"
 """
+import argparse
+import glob
+import json
 import os
 import sys
-import json
-import argparse
+import time
+from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import paper_table as pt
+from semantic_scholar_search import (
+    SemanticScholarSearcher, ApiUnavailableError, year_window,
+    assert_fields_cover, S2_FIELDS,
+    check_keyword_count, check_rounds, MAX_KEYWORDS,
+    DEFAULT_PUBLICATION_TYPES, DEFAULT_PER_ROUND,
+)
+from relevance_scorer import RelevanceScorer
+from journal_quartile import zone_map_for_journals
+import venue_rules
+import keyword_fetch
+import abstract_fill
+
+# 已知的多义词陷阱：这些词在别的领域有完全不同的含义，裸用会把跨领域文献
+# 一起召回。命中时只打提示，不改查询、不删结果 —— 判断权留给使用者。
+AMBIGUOUS_TERMS = {
+    "long-term memory": "也指 LSTM（long short-term memory）神经网络",
+    "long term memory": "也指 LSTM（long short-term memory）神经网络",
+    "working memory": "也是认知心理学的核心概念，会召回心理学实验论文",
+    "agent": "也指 agent-based modeling（环境、经济领域的「主体建模」）",
+    "transformer": "也指电力变压器",
+    "attention": "也指心理学注意机制",
+}
+
+
+def check_query_ambiguity(queries):
+    """提示查询里的多义词。**只提示，不改查询、不删结果。**"""
+    hits = []
+    for q in queries:
+        low = (q or "").lower()
+        for term, why in AMBIGUOUS_TERMS.items():
+            if term in low:
+                hits.append((q, term, why))
+    if hits:
+        print("[WARN] 查询里含多义词，可能召回跨领域文献（仅提示，不影响检索）：")
+        for q, term, why in hits:
+            print(f'  "{q}" 里的 `{term}`：{why}')
+        print("  建议：把限定词一起写进查询，如 `LLM agent memory` 而不是裸的 `agent`")
+    return hits
+
+
+# 淘汰原因分两类：不符合条件（有数据但不满足）/ 无数据可判（缺字段不纳入）
+TYPE_NO = "不符合条件"
+TYPE_NA = "无数据可判"
+
+
+# 六类**必得**字段（摘要除外，摘要能拿多少算多少）。
+# 这里只做统计与告警，**不拦截流程** —— 空值是数据事实，不是错误，
+# 但空在哪一类、空了多少，必须写在报告里让人看见。
+REQUIRED_FIELDS = [
+    ("题目", "title"), ("DOI", "doi"), ("作者", "authors"),
+    ("期刊", "venue"), ("发表时间", "publication_date"), ("关键词", "keywords"),
+]
+BEST_EFFORT_FIELDS = [("摘要", "abstract")]
+
+
+def field_completeness(records, stage=""):
+    """统计必得字段的填充率，并列出缺失最多的几类。只报告，不拦截。"""
+    n = len(records)
+    if not n:
+        return {}
+    out = {}
+    for label, key in REQUIRED_FIELDS + BEST_EFFORT_FIELDS:
+        got = sum(1 for r in records
+                  if str(r.get(key) or "").strip() and str(r.get(key)) != "0")
+        out[label] = (got, n)
+    print(f"[完整度] {stage}（{n} 行）")
+    for label, (got, tot) in out.items():
+        mark = "" if label == "摘要" else ("  ← 缺失" if got < tot else "")
+        tag = "（非硬性）" if label == "摘要" else ""
+        print(f"    {label:<8}{got:>6}/{tot}{tag}{mark}")
+    hard_missing = [(k, v) for k, v in out.items()
+                    if k != "摘要" and v[0] < v[1]]
+    if hard_missing:
+        detail = "、".join(f"{k} 缺 {v[1]-v[0]}" for k, v in hard_missing)
+        print(f"[完整度] 必得字段存在缺失：{detail}；"
+              f"汇报时必须说明这些空值是数据源缺失，不是筛选造成")
+    return out
+
+
+STAGES = [
+    "第1环节_原始检索",
+    "第2环节_去重",
+    "第3环节_近N年",
+    "第4环节_记录合规",
+    "第5环节_期刊等级",
+    "第6环节_相关度排序",
+]
+
+
+# ---------------------------------------------------------------- 工具
 
 def per_query_limit(target, page_size=100):
-    """每组关键词应取多少篇 = 目标篇数向上取整到整页。
-
-    目标 200 -> 200（2 页）；目标 300 -> 300（3 页）。
-    """
+    """每组关键词应取多少篇 = 目标篇数向上取整到整页。"""
     pages = max(1, -(-int(target) // page_size))
     return pages * page_size
 
 
-def run(queries, out_dir, per_round=None, top_n=None, prefix="论文元数据",
-        use_bge=True, publication_types=None, max_keywords=None,
-        strict=True, target=None, gate_profile=None, gate_min_pass=20,
-        gate_min_rate=0.10, searcher=None, scorer=None, verbose=True):
-    """标准检索：3~4 轮关键词（每轮 ≤5 词，各取 500 篇）→ BGE 每组独立评分
-    → 合并排序 → 落盘 Excel。
+_EXTRA_ALIAS = {
+    "轮次": "round_no", "该轮关键词": "round_query",
+    "命中轮次": "hit_rounds", "命中轮数": "hit_count",
+    "年份判定依据": "year_basis", "淘汰环节": "drop_stage",
+    "淘汰原因": "drop_reason",
+}
 
-    ⚠️ 标准流程（用户 2026-09-20 指定，务必遵守）
-    ------------------------------------------------
-    1. **不做探针轮**。"微调变体"本身承担试探作用，不要再单独发请求试词。
-    2. **每轮关键词 ≤5 个**，超限直接报错。S2 是相关性检索，写长 = 召回暴跌
-       （实测 7 词→100 篇，9 词→11 篇，13 词→6 篇，见 AGENTS.md §3.5.4.1）。
-    3. **固定 3~4 轮**，每轮是同一题目的一次**微调**（换角度/同义词/换手段），
-       各取 500 篇（5 页）。
-    4. **API 调用预算**：3~4 轮 × 2 页 = **6~8 次请求**，加少量 429 重试即完成。
-       检索响应已直接带回 DOI/摘要/OA 链接，**不再需要 Phase 2 逐篇补详情**。
-    5. **S2 不可用即刻上报**：任一轮失败即保全已取回结果、落盘完整性报告并抛出，
-       由调用方立即向用户汇报（不静默、不换源、不用匿名请求）。
 
-    Args:
-        queries: 3~4 条关键词（每条 ≤5 词），互为微调变体
-        out_dir: 产出目录
-        per_round: **每轮**取回篇数（默认 500 = 5 页）
-        top_n: **入表**篇数上限，合并去重后取前 N（默认 None = 不截断）
-        prefix: 表文件名前缀
-        use_bge: True 用 BGE 全局排序；False 退回轮转融合（不加载模型）
-        publication_types: 默认 ["JournalArticle", "Review"]（排除会议）
-        max_keywords: 单轮关键词上限，默认 MAX_KEYWORDS（5）
-        strict: True = 轮数/关键词数不合规直接报错
-        target: **已废弃**，仅为兼容旧调用；等价于同时指定 per_round 与 top_n
-        gate_profile: **主题闸门配置**（None = 不过闸门）。
-            传 profile id（如 "building-envelope-ndt"）或 profile dict。
-            ⚠️ **每次检索都应为本次题目准备一条 profile：2~3 个闸门、每闸门约 50 词。**
-            内置的只覆盖「建筑外保温无损检测」，用错题目会把候选池杀光。
-            闸门按**标题 + 摘要**判（摘要随检索已带回），顺序是
-            「全量排序 → 过闸门 → 截断到 top_n」，避免名额浪费。
-        gate_min_pass / gate_min_rate: 过窄自检阈值；放行低于阈值会打告警
-        searcher / scorer: 仅测试用，可注入替身
+def _rec(p, **extra):
+    """PaperInfo → 表记录（英文标准键 + 中文扩展键）。"""
+    d = {
+        "paper_id": p.paper_id,
+        "doi": p.doi,
+        "title": p.title,
+        "authors": p.authors,
+        "year": p.year,
+        "venue": p.venue,
+        "citation_count": p.citation_count,
+        "is_journal": p.is_journal,
+        "is_conference": p.is_conference,
+        "is_preprint": p.is_preprint,
+        "pdf_url": p.pdf_url,
+        "abstract": p.abstract,
+        "quartile": p.quartile,
+        "relevance_score": p.relevance_score,
+        "publication_date": p.publication_date,
+        "issn": p.issn,
+        "keywords": p.keywords,
+        "abstract_source": p.abstract_source,
+        "is_retracted": p.is_retracted,
+        "is_layout_record": p.is_layout_record,
+        "is_suspicious": p.is_suspicious,
+        "record_reasons": p.record_reasons,
+        "zone_basis": p.zone_basis,
+        "zone_status": p.zone_status,
+    }
+    # 调用方可能用中文键传扩展列，而 PREFERRED 里声明的是英文键。
+    # 不做这一步的话 build_columns 会按不同的 key 各建一列，Excel 里出现同名重复列。
+    for _k in list(extra):
+        extra[_EXTRA_ALIAS.get(_k, _k)] = extra.pop(_k)
+    d.update(extra)
+    return d
 
-    Returns:
-        {"papers": 入表篇数, "path": xlsx 路径, "report": 完整性报告,
-         "rounds": [(查询, 篇数), ...], "api_calls": 请求次数}
 
-    ⚠️ 本函数返回后**请让进程结束**，否则 BGE 占的内存不会归还（见模块 docstring）。
+def _raw_sink(raw_dir, tag):
+    """返回一个把 S2 原始响应逐次落盘的钩子。"""
+    os.makedirs(raw_dir, exist_ok=True)
+    box = {"n": 0}
+
+    def sink(url, params, payload):
+        box["n"] += 1
+        p = os.path.join(raw_dir, f"{tag}_p{box['n']}.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    return sink
+
+
+def _save(records, out_dir, name):
+    """用 paper_table 的列定义落盘，并把文件名固定成 name.xlsx。"""
+    target = os.path.join(out_dir, name + ".xlsx")
+    path = None
+    try:
+        path = pt.save_papers_xlsx(records, out_dir, prefix=name,
+                                   total_limit=None)
+    except TypeError:
+        path = pt.save_papers_xlsx(records, out_dir, prefix=name)
+    if path and os.path.exists(path) and \
+            os.path.abspath(path) != os.path.abspath(target):
+        os.replace(path, target)
+    elif not os.path.exists(target):
+        cands = sorted(glob.glob(os.path.join(out_dir, name + "*.xlsx")))
+        if cands:
+            os.replace(cands[-1], target)
+    return target
+
+
+class Ledger:
+    """筛选过程记录 + 筛选淘汰记录。"""
+
+    def __init__(self):
+        self.steps = []          # (环节, 进入数, 保留数, {原因: 篇数})
+        self.dropped = []
+
+    def add(self, stage, before, kept, reasons, dropped_rows=None):
+        self.steps.append((stage, before, kept, reasons or {}))
+        self.dropped.extend(dropped_rows or [])
+
+    def write(self, out_dir, params):
+        lines = ["# 筛选过程记录", ""]
+        lines.append("## 本次参数")
+        for k, v in params.items():
+            lines.append(f"- {k}: {v}")
+        lines.append("")
+        lines.append("## 逐环节进出")
+        lines.append("")
+        lines.append("| 环节 | 进入 | 保留 | 淘汰 | 淘汰原因分布 |")
+        lines.append("|---|---|---|---|---|")
+        for stage, before, kept, reasons in self.steps:
+            dist = "；".join(f"{k} {v}" for k, v in
+                             sorted(reasons.items(), key=lambda x: -x[1])) or "-"
+            lines.append(f"| {stage} | {before} | {kept} | "
+                         f"{max(before - kept, 0)} | {dist} |")
+        lines.append("")
+        lines.append("> 本文件只记数量与原因分类。逐条明细见 `筛选淘汰记录.xlsx`，"
+                     "其中「淘汰环节」「淘汰原因」两列可直接筛。")
+        with open(os.path.join(out_dir, "筛选过程记录.md"), "w",
+                  encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        if self.dropped:
+            try:
+                pt.save_papers_xlsx(self.dropped, out_dir,
+                                    prefix="筛选淘汰记录", total_limit=None)
+                cands = sorted(glob.glob(os.path.join(
+                    out_dir, "筛选淘汰记录*.xlsx")))
+                if cands:
+                    os.replace(cands[-1],
+                               os.path.join(out_dir, "筛选淘汰记录.xlsx"))
+            except Exception as e:
+                print(f"[WARN] 淘汰记录落盘失败：{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------- 各环节
+
+def stage_search(searcher, queries, per_round, pub_types, out_dir=None,
+                 verbose=True, raw_dir=None):
+    """第 1 环节：多轮检索，不设年份。
+
+    S2 不可用时**必须保全已取回结果再抛出**：既要拿 collected_partial()
+    （中断那条查询已翻到的页），也要拿前面已完整取回的轮次，并把完整
+    性报告与部分结果都落到 out_dir。**不能只抛不存** —— 那会让前几轮
+    已经花掉的请求全部白费，是 2026-11-02 实测踩到的真实缺陷。
     """
-    from semantic_scholar_search import (
-        SemanticScholarSearcher, ApiUnavailableError, check_keyword_count,
-        check_rounds, MAX_KEYWORDS, DEFAULT_PER_ROUND, DEFAULT_TOTAL_LIMIT)
+    groups = []                 # [(query, [papers])]
+    merged, rounds_of, query_of = {}, {}, {}
+    for i, q in enumerate(queries, 1):
+        if raw_dir:
+            searcher.raw_sink = _raw_sink(raw_dir, f"r{i}")
+        try:
+            ps = searcher.search_paginated(query=q, total_limit=per_round,
+                                          publication_types=pub_types)
+        except ApiUnavailableError:
+            dest = out_dir or os.path.dirname(os.path.abspath(__file__))
+            try:
+                searcher.save_search_report(dest)
+            except Exception:
+                pass
+            salvaged = list(searcher.collected_partial())
+            seen = {p.paper_id for p in salvaged}
+            for _q, _ps in groups:
+                for p in _ps:
+                    if p.paper_id not in seen:
+                        seen.add(p.paper_id)
+                        salvaged.append(p)
+            for p in salvaged:
+                merged.setdefault(p.paper_id, p)
+                rounds_of.setdefault(p.paper_id, [i - 1])
+                query_of.setdefault(p.paper_id, q)
+            if salvaged:
+                try:
+                    _save([_rec(p) for p in salvaged], dest,
+                          "部分结果_中断前已取回")
+                    if verbose:
+                        print(f"[保全] 中断前已取回的 {len(salvaged)} 篇已落盘"
+                              f" -> {dest}")
+                except Exception as e:
+                    print(f"[WARN] 部分结果落盘失败：{type(e).__name__}: {e}")
+            raise
+        groups.append((q, ps))
+        for p in ps:
+            if p.paper_id not in merged:
+                merged[p.paper_id] = p
+                rounds_of[p.paper_id] = [i - 1]
+                query_of[p.paper_id] = q
+            elif (i - 1) not in rounds_of[p.paper_id]:
+                rounds_of[p.paper_id].append(i - 1)
+        if verbose:
+            flag = "" if len(ps) >= 50 else "  ← 偏少，考虑在该轮换措辞"
+            print(f"[检索] 第 {i} 轮 -> {len(ps)} 篇，累计唯一 {len(merged)}{flag}")
+        time.sleep(0.2)
+    return groups, merged, rounds_of, query_of
 
-    if publication_types is None:
-        publication_types = ["JournalArticle", "Review"]
-    if max_keywords is None:
-        max_keywords = MAX_KEYWORDS
 
-    # 兼容旧调用：target 同时决定每轮篇数与入表篇数
-    if target is not None:
-        per_round = per_round or per_query_limit(target)
-        top_n = top_n or target
+def stage_years(papers, years):
+    """第 3 环节：近 N 年（滑动窗口，只设下界）。"""
+    lower, floor_year = year_window(years)
+    kept, dropped = [], []
+    for p in papers:
+        d = (p.publication_date or "").strip()
+        ok = None
+        basis = ""
+        if len(d) >= 10:
+            try:
+                ok = date.fromisoformat(d[:10]) >= lower
+                basis = "日期"
+            except ValueError:
+                ok = None
+        if ok is None:
+            if p.year:
+                ok = p.year >= floor_year
+                basis = "年份"
+            else:
+                ok = False
+                basis = "缺失"
+        p.year_basis = basis
+        if ok:
+            kept.append(p)
+        elif basis == "缺失":
+            dropped.append((p, TYPE_NA, "无发表时间与年份，无法判定"))
+        else:
+            dropped.append((p, TYPE_NO, f"早于窗口下界 {lower}"))
+    return kept, dropped, lower
+
+
+def stage_compliance(papers, allow_preprint=False, allow_conference=False):
+    """第 4 环节：剔除与标记。
+
+    默认两个开关都关，即「只要期刊论文」（排除会议论文与预印本）。
+    `allow_preprint` / `allow_conference` 可分别放行。会议录卷级条目与
+    撤稿不受开关影响，永远剔除。
+    """
+    kept, dropped = [], []
+    reasons = {}
+    for p in papers:
+        cls = venue_rules.classify_record(
+            title=p.title, venue=p.venue,
+            publication_types=(["Conference"] if p.is_conference else []),
+            external_ids=({"ArXiv": 1} if p.is_preprint else {}),
+            doi=p.doi, abstract=p.abstract, year=p.year)
+        p.is_retracted = bool(cls["is_retracted"])
+        p.is_layout_record = bool(cls["is_layout_record"])
+        p.is_suspicious = bool(cls["is_suspicious"])
+        p.record_reasons = ";".join(cls["reasons"])
+        if venue_rules.should_drop(cls, allow_preprint=allow_preprint,
+                                   allow_conference=allow_conference):
+            key = "其他"
+            for r in cls["reasons"]:
+                if r.startswith(("会议", "预印本", "撤稿")):
+                    key = r
+                    break
+            dropped.append((p, TYPE_NO, key))
+            continue
+        # 既无 publicationTypes 又无刊名 → 无法判定是否会议/预印本 → 按新语义排除
+        if (not (p.venue or "").strip() and not p.is_journal
+                and not p.is_conference and not p.is_preprint):
+            dropped.append((p, TYPE_NA, "无文献类型与刊名，无法判定"))
+            continue
+        kept.append(p)
+    reasons = {}
+    for _p, _t, _why in dropped:
+        k = f"[{_t}] {_why}"
+        reasons[k] = reasons.get(k, 0) + 1
+    return kept, dropped, reasons
+
+
+def stage_zones(papers, basis, refresh=False, verbose=True):
+    """第 5 环节：查分区并回填。分区为空 = 未查询到，不等于等级不够。"""
+    name_to_doi, issns = {}, {}
+    for p in papers:
+        v = (p.venue or "").strip()
+        if v and v not in name_to_doi:
+            name_to_doi[v] = p.doi or ""
+            if p.issn:
+                issns[v] = p.issn
+    if not name_to_doi:
+        print("[分区] 没有任何刊名，跳过查询")
+    else:
+        zmap = zone_map_for_journals(name_to_doi, refresh=refresh,
+                                     verbose=verbose, issns=issns, basis=basis)
+        for p in papers:
+            v = (p.venue or "").strip()
+            p.quartile = zmap.get(v) or ""
+    for p in papers:
+        p.zone_basis = basis
+        p.zone_status = ("已收录" if p.quartile
+                         else ("刊名为空" if not (p.venue or "").strip()
+                               else "未查询到"))
+    return papers
+
+
+def stage_rank(papers, topic, use_bge=True, w_title=0.6, w_kw=0.4,
+               top_n=None):
+    """第 6 环节前半：OpenAlex 取关键词与摘要 → BGE 排序 → 可选截取。"""
+    if not papers:
+        return papers, []
+    dois = [p.doi for p in papers if p.doi]
+    if dois:
+        print(f"[OpenAlex] 按 DOI 批量取关键词与摘要（{len(dois)} 个 DOI）")
+        data = keyword_fetch.fetch_by_dois(dois, verbose=True)
+        n_kw = n_ab = 0
+        for p in papers:
+            d = data.get(keyword_fetch.norm_doi(p.doi))
+            if not d:
+                continue
+            if d["keywords_text"]:
+                p.keywords = d["keywords_text"]
+                n_kw += 1
+            if d["abstract"] and not (p.abstract or "").strip():
+                p.abstract = d["abstract"]
+                p.abstract_source = "OpenAlex"
+                n_ab += 1
+        print(f"[OpenAlex] 补关键词 {n_kw} 篇 | 补摘要 {n_ab} 篇")
+
+    if use_bge and topic:
+        with RelevanceScorer(lang="en") as sc:
+            papers = sc.rank_topic(topic, papers, w_title=w_title, w_kw=w_kw)
+    else:
+        print("[BGE] 跳过排序（--no-bge 或 --topic 为空）")
+
+    truncated = []
+    if top_n and len(papers) > top_n:
+        truncated = papers[top_n:]
+        papers = papers[:top_n]
+        print(f"[截取] 前 {top_n} 篇用于补摘要，其余 {len(truncated)} 篇留在全量表")
+    return papers, truncated
+
+
+def stage_abstracts(papers, verbose=True):
+    """第 6 环节后半：Elsevier → PubMed 两档，只处理缺摘要的行。
+
+    OpenAlex 那一档已在取关键词时顺带完成，不重复调用。
+    """
+    todo = [p for p in papers if not (p.abstract or "").strip() and p.doi]
+    if not todo:
+        print("[摘要] 没有需要补的行")
+        return
+    key = abstract_fill.load_key()
+    print(f"[摘要] 待补 {len(todo)} 篇；"
+          f"Elsevier key {'已找到' if key else '未找到'}")
+    for i, p in enumerate(todo, 1):
+        ab, src, log = abstract_fill.fill_one(p.doi, key=key)
+        if ab:
+            p.abstract = ab
+            p.abstract_source = src
+        if verbose:
+            tag = f"OK {src}" if ab else "MISS " + "; ".join(log)[:56]
+            print(f"  [{i}/{len(todo)}] {tag} | {(p.title or '')[:52]}")
+
+
+# ---------------------------------------------------------------- 主流程
+
+def run(queries, topic, out_dir, per_round=None, years=10,
+        zone_basis="jcr", zone_filter=("1",), top_n=None,
+        use_bge=True, refresh_zone=False, publication_types=None,
+        max_keywords=None, strict=True, searcher=None, verbose=True,
+        allow_preprint=False, allow_conference=None, domain="general"):
+    """跑完六个环节，返回本次产物路径字典。
+
+    ⚠️ 本函数返回后**请让进程结束**，否则 BGE 占的内存不会归还。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    pub_types = publication_types or DEFAULT_PUBLICATION_TYPES
     per_round = per_round or DEFAULT_PER_ROUND
-    top_n = top_n or DEFAULT_TOTAL_LIMIT
+    max_keywords = max_keywords or MAX_KEYWORDS
+    # 领域默认值：计算机领域以会议为主要发表渠道，默认放行单篇会议论文；
+    # 其它领域仍默认排除。显式传 allow_conference 时以传入值为准。
+    if allow_conference is None:
+        allow_conference = (str(domain).strip().lower() == "cs")
+    if str(domain).strip().lower() == "cs":
+        print("[DOMAIN] 领域=cs：默认放行单篇会议论文"
+              "（预印本仍默认排除，需要时加 --allow-preprint）")
+    ledger = Ledger()
+    out = {}
 
-    # ---- 规范校验：轮数与关键词数（不合规直接拦，避免静默少召回）----
+    # 字段存在性断言：请求字段必须覆盖解析字段，缺一个立刻失败
+    assert_fields_cover(S2_FIELDS)
+
+    # 规范校验：轮数与关键词数（不合规直接拦，避免静默少召回）
     check_rounds(queries, strict=strict)
     for q in queries:
         check_keyword_count(q, max_keywords=max_keywords, strict=strict)
 
+    check_query_ambiguity(queries)
+
     pages = max(1, -(-int(per_round) // 100))
-    est_calls = pages * len(queries)
     if verbose:
-        print(f"[PIPELINE] 标准检索：{len(queries)} 轮 × 每轮 {per_round} 篇"
-              f"（{pages} 页）→ 候选池最多 {per_round * len(queries)} 篇")
-        print(f"[PIPELINE] 预计 {est_calls} 次 S2 请求（+少量 429 重试）；"
-              f"检索响应已含 DOI/摘要，无需 Phase 2 补取")
-        for i, q in enumerate(queries, 1):
-            n, _ = check_keyword_count(q, max_keywords=max_keywords, strict=False)
-            print(f"[PIPELINE]   第 {i} 轮（{n} 词）：{q}")
+        print(f"[PIPELINE] {len(queries)} 轮 × 每轮 {per_round} 篇（{pages} 页）"
+              f"→ 候选池最多 {per_round * len(queries)} 篇")
+        print(f"[PIPELINE] 预计 {pages * len(queries)} 次 S2 请求")
 
     s = searcher or SemanticScholarSearcher()
-    groups, rounds_yield = [], []
-    try:
-        for i, q in enumerate(queries, 1):          # 串行，不并发
-            ps = s.search_paginated(query=q, total_limit=per_round,
-                                    publication_types=publication_types)
-            groups.append((q, ps))
-            rounds_yield.append((q, len(ps)))
-            if verbose:
-                flag = "" if len(ps) >= 50 else "  ← 偏少，考虑在该轮换措辞"
-                print(f"[PIPELINE] 第 {i} 轮 -> {len(ps)} 篇{flag}")
-    except ApiUnavailableError:
-        # 见 AGENTS.md §4.1：暂停检索、立即向用户汇报，不擅自换源、不用匿名请求
-        try:
-            s.save_search_report(out_dir)           # 失败也要留痕
-        except Exception:
-            pass
-        # ⚠️ **必须保全中断前已取回的部分结果** —— AGENTS.md 的硬性要求「失败不得丢数据」。
-        # 2026-09-20 实测踩坑：早期这里只存报告、不存论文，导致前 3 轮已取回的 700 篇
-        # 随进程退出全部丢失，重跑时白花 8 次 S2 请求。
-        try:
-            # 两处都要取：
-            #   ① collected_partial() —— "中断那条查询"在报错前已翻到的页
-            #   ② groups —— **已完整取回的轮次**（早期只取①，实测导致
-            #      第 1、2 轮已到手的 400 篇全部白丢，重跑又花 8 次请求）
-            salvaged = list(s.collected_partial())
-            _seen = {getattr(p, "paper_id", "") for p in salvaged}
-            for _q, _ps in groups:
-                for p in _ps:
-                    _pid = getattr(p, "paper_id", "")
-                    if _pid not in _seen:
-                        _seen.add(_pid)
-                        salvaged.append(p)
-            if salvaged:
-                from paper_table import save_papers_xlsx
-                _p = save_papers_xlsx(salvaged, out_dir,
-                                      prefix="部分结果_中断前已取回",
-                                      sheet_title="部分结果", total_limit=None)
-                if verbose:
-                    print(f"[PIPELINE] 已保全中断前取回的 {len(salvaged)} 篇 -> {_p}")
-        except Exception as _e:
-            print(f"[PIPELINE] [WARN] 部分结果保全失败：{_e}")
-        if verbose:
-            print("[PIPELINE] ⚠️ S2 不可用，检索已暂停。已取回结果已保全，"
-                  "请立即向用户汇报并询问：等待恢复，还是降级 Crossref（最后手段）。")
-        raise
 
-    rep = s.search_report() if hasattr(s, "search_report") else {}
+    # ---- 第 1 环节 ----
+    groups, merged, rounds_of, query_of = stage_search(
+        s, queries, per_round, pub_types, out_dir=out_dir, verbose=verbose,
+        raw_dir=os.path.join(out_dir, "raw"))
+    # 第 1 环节落**原始返回行**：同一篇被多轮召回就出现多行，重复留给第 2 环节去化。
+    # 这样「检索 -> 去重」才是两个有实际数据变化的环节。
+    rec1 = []
+    for i, (q, ps) in enumerate(groups, 1):
+        for p in ps:
+            rec1.append(_rec(p, round_no=i, round_query=q))
+    _seen1 = {(r.get("paper_id"), r.get("round_no")) for r in rec1}
+    for pid, p in merged.items():          # 失败中断时 groups 不完整，补上保全的部分
+        for idx in rounds_of.get(pid, [0]):
+            if (pid, idx + 1) not in _seen1:
+                rec1.append(_rec(p, round_no=idx + 1,
+                                 round_query=query_of.get(pid, "")))
+    out["stage1"] = _save(rec1, out_dir, STAGES[0])
+    field_completeness(rec1, "第1环节_原始检索")
+    ledger.add(STAGES[0], len(rec1), len(rec1), {})
     try:
         s.save_search_report(out_dir)
-    except Exception as e:
-        if verbose:
-            print(f"[PIPELINE] [WARN] 完整性报告落盘失败：{e}")
+    except Exception:
+        pass
 
-    if not any(ps for _, ps in groups):
+    if not merged:
         raise RuntimeError(
-            "3~4 轮查询均未取回任何文献 —— 这属于「确实未命中」，不是检索失败；"
+            "各轮查询均未取回任何文献 —— 这属于「确实未命中」，不是检索失败；"
             "请连同所用关键词向用户说明。")
 
-    # ---- 排序：BGE 每组独立评分 → 合并去重 → 全局降序 ----
-    # 先做**全量排序**，再过闸门，最后才截断到 top_n ——
-    # 顺序颠倒会让被闸门剔除的名额白白浪费掉。
-    if use_bge:
-        from relevance_scorer import RelevanceScorer
-        sc = scorer or RelevanceScorer(lang="en")     # 论文检索固定英文分支
-        papers = sc.rank_groups(groups, total_limit=None)
-    else:
-        from paper_table import interleave_by_query
-        # ⚠️ interleave_by_query 要的是 {查询: [论文]} 或 [[论文], ...]，
-        # **不能直接喂 groups**（那是 [(查询, [论文]), ...]）——
-        # 否则每个元组会被当成一个「桶」，轮转时把查询字符串和论文列表
-        # 本身当成论文取出来（实测报 "无法识别的论文对象类型: <class 'str'>"）。
-        papers = interleave_by_query([ps for _, ps in groups], total_limit=None)
-        if verbose:
-            print("[PIPELINE] 未启用 BGE，改用轮转融合")
+    # ---- 第 2 环节：真去重。按 paper_id 保留首次出现，累计命中轮次 ----
+    order, agg = [], {}
+    for r in rec1:
+        pid = r.get("paper_id")
+        if pid not in agg:
+            agg[pid] = {"rec": dict(r), "rounds": []}
+            order.append(pid)
+        rn = r.get("round_no")
+        if rn and rn not in agg[pid]["rounds"]:
+            agg[pid]["rounds"].append(rn)
+    rec2 = []
+    for pid in order:
+        base = agg[pid]["rec"]
+        rounds = sorted(agg[pid]["rounds"])
+        base["hit_rounds"] = ",".join(str(x) for x in rounds)
+        base["hit_count"] = len(rounds)
+        rec2.append(base)
+    papers = [merged[pid] for pid in order if pid in merged]
+    out["stage2"] = _save(rec2, out_dir, STAGES[1])
+    ledger.add(STAGES[1], len(rec1), len(rec2),
+               {"重复记录": max(len(rec1) - len(rec2), 0)})
 
-    # ---- 主题闸门（按【标题 + 摘要】判；用户 2026-09-20 指定接入流水线）----
-    gate_stat = None
-    if gate_profile is not None:
-        from topic_gate import apply_gate
-        before = len(papers)
-        passed, rejected, gwarn = apply_gate(
-            papers, gate_profile, min_pass=gate_min_pass,
-            min_rate=gate_min_rate)
-        papers = [p for p, _ in passed]
-        by_title = sum(1 for _, i in passed if i.get("_source") == "标题")
-        gate_stat = {"before": before, "after": len(papers),
-                     "rejected": len(rejected),
-                     "by_title": by_title,
-                     "by_abstract": len(papers) - by_title}
-        if verbose:
-            print(f"[GATE] 主题闸门（标题+摘要）：{before} → {len(papers)} 篇"
-                  f"（剔除 {len(rejected)}；其中靠标题命中 {by_title}、"
-                  f"靠摘要才命中 {len(papers) - by_title}）")
-        if gwarn:
-            print(f"[GATE] {gwarn}")
-        if not papers:
-            raise RuntimeError(
-                "主题闸门把所有候选都剔除了：这几乎一定是**闸门配置过窄/用错主题**，"
-                "不是「该领域没有文献」。请检查 gate_profile，或先用 --loose 看原始排序。")
+    # ---- 第 3 环节 ----
+    before = len(papers)
+    papers, dropped, lower = stage_years(papers, years)
+    out["stage3"] = _save([_rec(p, 年份判定依据=p.year_basis) for p in papers],
+                          out_dir, STAGES[2])
+    r3 = {}
+    for _p, _t, _why in dropped:
+        k = f"[{_t}] {_why}"
+        r3[k] = r3.get(k, 0) + 1
+    ledger.add(STAGES[2], before, len(papers), r3,
+               [dict(_rec(_p), 淘汰环节=STAGES[2], 淘汰原因=_why, 淘汰原因类型=_t)
+                for _p, _t, _why in dropped])
 
-    papers = papers[:top_n] if top_n else papers
+    # ---- 第 4 环节 ----
+    before = len(papers)
+    papers, dropped, reasons = stage_compliance(
+        papers, allow_preprint=allow_preprint,
+        allow_conference=allow_conference)
+    out["stage4"] = _save([_rec(p) for p in papers], out_dir, STAGES[3])
+    ledger.add(STAGES[3], before, len(papers), reasons,
+               [dict(_rec(_p), 淘汰环节=STAGES[3], 淘汰原因=_why, 淘汰原因类型=_t)
+                for _p, _t, _why in dropped])
 
-    # ---- 落盘 ----
-    from paper_table import save_papers_xlsx
-    path = save_papers_xlsx(papers, out_dir, prefix=prefix, total_limit=top_n)
+    # ---- 第 5 环节 ----
+    before = len(papers)
+    papers = stage_zones(papers, zone_basis, refresh=refresh_zone,
+                         verbose=verbose)
+    want = {z.strip().replace("区", "")
+            for z in zone_filter} if zone_filter else set()
+    kept5, drop5 = [], []
+    for p in papers:
+        if not (p.venue or "").strip():
+            drop5.append((p, TYPE_NA, "无期刊名，无法查分区"))
+        elif not p.quartile:
+            drop5.append((p, TYPE_NA, "分区未查询到（该刊未被分区库收录）"))
+        elif want and p.quartile not in want:
+            drop5.append((p, TYPE_NO, f"分区 {p.quartile} 区不在 {sorted(want)}"))
+        else:
+            kept5.append(p)
+    out["stage5"] = _save([_rec(p) for p in kept5], out_dir, STAGES[4])
+    zr = {}
+    for _p, _t, _why in drop5:
+        k = f"[{_t}] {_why}"
+        zr[k] = zr.get(k, 0) + 1
+    ledger.add(STAGES[4], before, len(kept5), zr,
+               [dict(_rec(_p), 淘汰环节=STAGES[4], 淘汰原因=_why,
+                     淘汰原因类型=_t) for _p, _t, _why in drop5])
+    papers = kept5
 
-    calls = getattr(s, "request_count", None)
-    if verbose:
-        try:
-            import psutil
-            mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
-            print(f"[PIPELINE] 本进程当前占用 {mb:.0f} MB（含 BGE）；"
-                  f"**请让本进程结束以归还内存**")
-        except Exception:
-            pass
-        print(f"[PIPELINE] 本次共 {calls} 次 S2 请求")
-        print(f"[PIPELINE] 完成 -> {path}")
+    # ---- 第 6 环节 ----
+    before = len(papers)
+    papers, truncated = stage_rank(papers, topic, use_bge=use_bge, top_n=top_n)
+    stage_abstracts(papers, verbose=verbose)
+    rec6 = [_rec(p) for p in papers]
+    out["stage6"] = _save(rec6, out_dir, STAGES[5])
+    field_completeness(rec6, "第6环节_相关度排序")
+    if truncated:
+        out["stage6_full"] = _save([_rec(p) for p in papers + truncated],
+                                   out_dir, STAGES[5] + "_全量")
+    ledger.add(STAGES[5], before, len(papers), {})
 
-    return {"papers": len(papers), "path": path, "report": rep,
-            "rounds": rounds_yield, "api_calls": calls, "gate": gate_stat}
+    params = {
+        "检索轮数": len(queries),
+        "每轮上限": per_round,
+        "近 N 年": f"{years}（下界 {lower}，只设下界，不设上界）",
+        "分区标准": zone_basis,
+        "放行预印本": "是" if allow_preprint else "否（默认）",
+        "放行会议论文": "是" if allow_conference else "否（默认）",
+        "领域": domain,
+        "分区条件": sorted(want) if want else "不限",
+        "排序方式": (f"BGE 单句主题描述（标题 {0.6} + 关键词 {0.4}）"
+                     if use_bge else "未排序"),
+        "主题描述": topic or "（空）",
+        "截取": f"前 {top_n} 篇" if top_n else "不截取",
+        "统计窗口": f"{lower} 至 {date.today()}",
+    }
+    ledger.write(out_dir, params)
+    return out
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="标准文献检索（3~4 轮 ≤5 词关键词 → BGE 每组独立评分 → "
-                    "合并排序 → 落盘 Excel）")
-    ap.add_argument("queries", nargs="+",
-                    help="3~4 轮关键词，每轮 ≤5 词，互为微调变体")
-    ap.add_argument("--out", required=True, help="产出目录")
+    ap = argparse.ArgumentParser(description="六环节文献检索流水线")
+    ap.add_argument("--out", required=True, help="输出目录")
+    ap.add_argument("--topic", default="",
+                    help="一句英文主题描述，仅供 BGE 排序（与检索词分开）")
     ap.add_argument("--per-round", type=int, default=None,
-                    help="每轮取回篇数（默认 500 = 5 页）")
-    ap.add_argument("--top-n", type=int, default=None,
-                    help="入表篇数上限，取前 N；默认不限（闸门后有多少写多少）")
-    ap.add_argument("--prefix", default="论文元数据")
-    ap.add_argument("--no-bge", action="store_true",
-                    help="不加载 BGE，改用轮转融合（不占内存）")
+                    help="每轮取回上限（默认 300 = 3 页）")
+    ap.add_argument("--years", type=int, default=10, help="近 N 年（默认 10）")
+    ap.add_argument("--zone-basis", choices=["jcr", "xr"], default="jcr",
+                    help="分区标准：jcr（默认）或 xr（中科院新锐）")
+    ap.add_argument("--zone", default="1",
+                    help="分区条件，逗号分隔，如 1 或 1,2；空串=不限")
+    ap.add_argument("--top", type=int, default=None,
+                    help="只对前 N 篇补摘要（Elsevier/PubMed），默认全部")
+    ap.add_argument("--no-bge", action="store_true", help="不加载 BGE 排序")
+    ap.add_argument("--refresh-zone", action="store_true", help="分区全部重查")
+    ap.add_argument("--allow-preprint", action="store_true",
+                    help="放行预印本（arXiv/SSRN 等）。默认排除。"
+                         "计算机等领域预印本是主要载体")
+    ap.add_argument("--allow-conference", action="store_true",
+                    help="放行单篇会议论文。默认排除（--domain cs 时默认放行）。"
+                         "会议录卷级条目与撤稿不受此开关影响，仍会剔除")
+    ap.add_argument("--domain", choices=["general", "cs"], default="general",
+                    help="检索领域。general（默认）排除会议论文；"
+                         "cs = 计算机领域，默认放行会议论文"
+                         "（计算机以会议为主要发表渠道）")
     ap.add_argument("--loose", action="store_true",
-                    help="放宽校验：轮数不是 3~4、或关键词超过 5 个时只警告不报错")
-    ap.add_argument("--gate-profile", default=None,
-                    help="主题闸门配置 id（gate_profiles.json 或内置 "
-                         "building-envelope-ndt）；不给则不过闸门")
-    ap.add_argument("--gate-min-pass", type=int, default=20,
-                    help="过窄自检：放行篇数低于此值即告警（默认 20）")
-    ap.add_argument("--gate-min-rate", type=float, default=0.10,
-                    help="过窄自检：放行比例低于此值即告警（默认 0.10）")
-    ap.add_argument("--target", type=int, default=None,
-                    help="[已废弃] 同时指定每轮篇数与入表篇数")
-    ap.add_argument("--json", help="把结果报告也写进这个 json")
-    args = ap.parse_args()
+                    help="放宽校验（轮数非 3~4 或关键词超 5 个时只警告）")
+    ap.add_argument("--allow-letpub", action="store_true",
+                    help="允许 LetPub 兜底（须用户同意）")
+    ap.add_argument("--json", help="把产物路径写到这个 json")
+    ap.add_argument("queries", nargs="+", help="英文关键词组，每组 ≤5 词")
+    a = ap.parse_args()
 
-    res = run(args.queries, args.out, per_round=args.per_round,
-              top_n=args.top_n, prefix=args.prefix,
-              use_bge=not args.no_bge, strict=not args.loose,
-              target=args.target, gate_profile=args.gate_profile,
-              gate_min_pass=args.gate_min_pass,
-              gate_min_rate=args.gate_min_rate)
+    if a.allow_letpub:
+        import journal_quartile
+        journal_quartile.ALLOW_LETPUB = True
 
-    if args.json:
-        with open(args.json, "w", encoding="utf-8") as f:
-            json.dump({k: v for k, v in res.items()}, f,
-                      ensure_ascii=False, indent=2)
-        print(f"[SAVE] {args.json}")
+    zone_filter = tuple(z.strip() for z in (a.zone or "").split(",") if z.strip())
+    try:
+        paths = run(a.queries, a.topic, a.out, per_round=a.per_round,
+                    years=a.years, zone_basis=a.zone_basis,
+                    zone_filter=zone_filter, top_n=a.top,
+                    use_bge=not a.no_bge, refresh_zone=a.refresh_zone,
+                    strict=not a.loose,
+                    allow_preprint=a.allow_preprint,
+                    allow_conference=(a.allow_conference or a.domain == "cs"),
+                    domain=a.domain)
+    except ApiUnavailableError as e:
+        print(f"[FATAL] {e}")
+        print("[ACTION] 立即向用户提出二选一：")
+        print("  1) 等待 3~5 分钟后重试（首选）")
+        print("  2) 改用 Crossref 备用源，并必须说明其缺失：只能检索到有 DOI 的文献、"
+              "摘要覆盖低、只返回相关性前 N 条、覆盖偏向有 DOI 的英文期刊")
+        raise SystemExit(2)
+    for k, v in paths.items():
+        print(f"[OUT] {k}: {v}")
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump(paths, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     main()

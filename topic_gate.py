@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-"""主题闸门：按主题配置判定标题是否属于目标领域
+"""主题闸门（**已停用，不再接入流水线**）
+
+⚠️ 2026-11-02 起本功能已取消：六环节流水线不再调用它，相关性只靠 BGE 单句
+主题描述打分 + 人工复核。文件保留仅供历史参考与将来若需要「只标记不删除」
+时复用。下面 `python topic_gate.py --list-profiles` 之类命令仍可跑，
+但**它的输出不代表当前流程的实际筛选行为**。
+
+---
+
+原说明：主题闸门：按主题配置判定标题是否属于目标领域
 
 ## 判定规则
 
@@ -46,6 +55,13 @@
     python topic_gate.py --list-profiles
     python topic_gate.py --explain "标题" [--profile other-topic]
 """
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 import os
 import re
 import json
@@ -71,7 +87,7 @@ METHOD_TERMS: List[str] = [
 ]
 
 # ---- 闸门 2：对象 / 领域（58 词）----
-# ⚠️ 没有黑名单，所以这一轴的用词就是唯一的口径：
+# ⚠️ 没有黑名单，所以这一轴的用词就是唯一的标准：
 # 既要有 `insulat` 这种词干保证召回（外保温文献的标题措辞极分散），
 # 又要靠 `building / wall / facade / envelope / etics…` 把语境钉在建筑上。
 # 代价：电气绝缘、管道保温这类同名标题会一并放行 —— 这是"不要误杀"取向下的

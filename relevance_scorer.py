@@ -57,6 +57,13 @@ v2.0 的两处关键变更
     pip install psutil        # 可选，仅用于打印内存占用
 """
 import sys
+# 控制台编码兜底：Windows 默认 GBK，打印中文/特殊字符会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import io
 import gc
 
@@ -312,6 +319,75 @@ class RelevanceScorer:
                 safe_title = p.title[:80].encode('ascii', errors='replace').decode('ascii')
                 print(f"  [{i}] {p.relevance_score:.2f} | {safe_title}")
 
+        return sorted_papers
+
+    def rank_topic(self, sentence: str, papers: List['PaperInfo'],
+                   w_title: float = 0.6, w_kw: float = 0.4,
+                   verbose: bool = True) -> List['PaperInfo']:
+        """按「一句主题描述」给论文打分排序（推荐用法）。
+
+        与 `rank()` 的区别：
+          `rank()` 把查询拆成单词逐个编码再求均值，任何一个与该论文无关的词
+          都会把均值拉低，精准论文反而吃亏；`rank_topic()` 把整句编码成一个
+          向量，语义是完整的，不被无关词稀释。
+
+        打分维度只有两个：
+          - 标题：必有
+          - 关键词：来自 OpenAlex；缺失时收敛为纯标题分，不做按比例放大，
+            因为「缺关键词」不等于「关键词得 0 分」，放大反而制造新偏差
+
+        **摘要不参与打分。** 摘要覆盖率不稳定，且实测把它加进来对名次几乎无影响。
+
+        Args:
+            sentence: 从用户需求提炼的一句英文主题描述
+            papers: 论文列表，读 `title` 与 `keywords` 属性
+            w_title / w_kw: 两维权重，有关键词时按此合成
+
+        Returns:
+            按得分降序的论文列表（不删除任何论文），每篇 `relevance_score` 已赋值
+        """
+        if not papers:
+            return papers
+        if not (sentence or "").strip():
+            print("[BGE] 主题描述为空，保持原顺序")
+            return papers
+
+        self._ensure_model(sentence)
+        q = self.model.encode([sentence], normalize_embeddings=True)[0]
+
+        titles = [p.title or "" for p in papers]
+        T = self.model.encode(titles, normalize_embeddings=True,
+                              batch_size=64,
+                              show_progress_bar=len(titles) > 200)
+        s_t = T @ q
+
+        kws = [(getattr(p, "keywords", "") or "").strip() for p in papers]
+        has_kw = np.array([bool(k) for k in kws])
+        if has_kw.any():
+            K = self.model.encode([k if k else "" for k in kws],
+                                  normalize_embeddings=True, batch_size=64,
+                                  show_progress_bar=len(kws) > 200)
+            s_k = K @ q
+        else:
+            s_k = np.zeros(len(papers))
+
+        scores = np.where(has_kw, w_title * s_t + w_kw * s_k, s_t)
+        for i, p in enumerate(papers):
+            p.relevance_score = float(scores[i])
+
+        order = np.argsort(-scores)
+        sorted_papers = [papers[i] for i in order]
+
+        if verbose:
+            with_kw = int(has_kw.sum())
+            print(f"[BGE] 主题描述打分：{len(papers)} 篇，有关键词 {with_kw} 篇"
+                  f"（权重 标题 {w_title} / 关键词 {w_kw}）")
+            for i, p in enumerate(sorted_papers[:5], 1):
+                try:
+                    print(f"  [{i}] {p.relevance_score:.4f} | {(p.title or '')[:78]}")
+                except UnicodeEncodeError:
+                    safe = (p.title or "")[:78].encode("ascii", "replace").decode("ascii")
+                    print(f"  [{i}] {p.relevance_score:.4f} | {safe}")
         return sorted_papers
 
     @staticmethod

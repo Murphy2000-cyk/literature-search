@@ -17,6 +17,13 @@
 预期：数秒内结束，输出「全部通过」，退出码 0。
 """
 import sys
+# 控制台编码兜底：Windows 默认 GBK，打印中文/特殊字符会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import os
 import time
 

@@ -19,12 +19,19 @@
 """
 import os
 import sys
+# 控制台编码兜底：Windows 默认 GBK，打印中文/特殊字符会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 
 # 依赖已装进 py313 环境，无需 sys.path.insert
 try:
     import psutil
 except ImportError:
-    print("需要 psutil：& \"E:\\Anaconda3\\envs\\py313\\python.exe\" -m pip install psutil")
+    print("需要 psutil：python -m pip install psutil")
     sys.exit(1)
 
 # 判定关键词
@@ -123,7 +130,7 @@ def main():
     print("       Stop-Process -Id <上面列出的论文检索侧 PID>")
     print("     ⚠️ 只结束【论文检索侧】的 PID，不要动知识库侧的。")
     print("  3) 反过来，如果跑论文检索时想腾内存，可以临时停掉知识库侧：")
-    print("       python \"C:\\Users\\lenovo\\.agents\\skills\\Structured-KB-reflect\\scripts\\search_reflect.py\" --stop-daemon")
+    print("       python \"<知识库 skill 目录>\\scripts\\search_reflect.py\" --stop-daemon")
     print("     释放约 825 MB；下次用知识库时它会自动拉起。")
 
 

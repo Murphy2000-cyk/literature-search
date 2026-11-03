@@ -20,7 +20,13 @@ litsearch_output/
 *.log
 
 # ---- 缓存与本地数据 ----
-# 分区缓存：本机生成的分区查询缓存，体积大且时效性强，不入库
+# 分区数据：v2.1.0 起改为 data/journal_zone.xlsx 作权威源，属本地资产，不随仓库分发。
+# ⚠️ 修正记录（v2.2.0）：v2.1.0 的 CHANGELOG 声称已加入 .gitignore，但实际遗漏，
+#    导致 data/ 有被误提交的风险。此处在 v2.2.0 补上，勿再删除下面四行。
+data/
+# 旧版分区缓存（点号 JSON，v2.1.0 已废弃，仅本机残留），同样不入库
+.letpub_zone_cache.json
+# 历史缓存名（v2.0.x 及更早），保留兼容
 .quartile_cache.json
 # BGE / HuggingFace 模型缓存
 .cache/

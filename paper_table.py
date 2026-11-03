@@ -29,6 +29,13 @@
 """
 import os
 import sys
+# 控制台编码兜底：Windows 默认 GBK，打印中文/特殊字符会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import json
 import time
 import argparse
@@ -37,9 +44,15 @@ import argparse
 # 语义：所有查询合并去重之后取前 N 篇；**候选不足 N 篇时有多少存多少**，不补齐、不报错。
 # 想要更小的表用 `--top N`；传 0 与 None 同义（不限）。
 try:
-    from semantic_scholar_search import DEFAULT_TOTAL_LIMIT
+    from semantic_scholar_search import DEFAULT_TOTAL_LIMIT, year_window
 except Exception:                       # 允许本模块被单独使用时的兜底
     DEFAULT_TOTAL_LIMIT = None
+
+    def year_window(years=10, today=None):
+        from datetime import date as _d
+        t = today or _d.today()
+        low = t.replace(year=t.year - years)
+        return low, low.year
 
 # ---------------------------------------------------------------- 列定义
 
@@ -52,16 +65,33 @@ PREFERRED = [
     ("中文标题", "title_cn", False),
     ("作者", "authors", False),
     ("年份", "year", False),
+    ("发表时间", "publication_date", False),
     ("期刊", "venue", False),
+    ("ISSN", "issn", True),
     ("中科院分区", "quartile", False),
+    ("分区依据", "zone_basis", False),
+    ("分区状态", "zone_status", False),
     ("引用数", "citation_count", False),
+    ("关键词", "keywords", False),
     ("BGE分数", "relevance_score", False),
     ("是否期刊", "is_journal", False),
     ("是否会议", "is_conference", False),
     ("疑似会议", "suspected_conference", False),
     ("是否预印本", "is_preprint", False),
+    ("是否撤稿", "is_retracted", False),
+    ("版面元素", "is_layout_record", False),
+    ("记录可疑", "is_suspicious", False),
+    ("记录说明", "record_reasons", False),
+    ("轮次", "round_no", False),
+    ("该轮关键词", "round_query", False),
+    ("命中轮次", "hit_rounds", False),
+    ("命中轮数", "hit_count", False),
+    ("年份判定依据", "year_basis", False),
+    ("淘汰环节", "drop_stage", False),
+    ("淘汰原因", "drop_reason", False),
     ("PDF链接", "pdf_url", False),
     ("摘要", "abstract", False),
+    ("摘要来源", "abstract_source", False),
     ("中文摘要", "abstract_cn", False),
     ("选中", "__selected__", False),
 ]
@@ -186,7 +216,7 @@ def interleave_by_query(results_by_query, total_limit=DEFAULT_TOTAL_LIMIT):
 
     out, seen = [], set()
     idx = 0
-    # total_limit=None / 0 表示不截断（与 rank_groups 的语义对齐）——
+    # total_limit=None / 0 表示不截断（与 rank_groups 的语义对应）——
     # 早期这里直接写 `while len(out) < total_limit`，传 None 会 TypeError。
     limit = total_limit if total_limit else float("inf")
     while len(out) < limit:
@@ -402,6 +432,33 @@ def apply_filters(rows, args, headers):
     needed = []
     conds = []
 
+    if getattr(args, "years", None):
+        # 滑动窗口：下界 = 今天 - N 年（精确到日），只设下界不设上界
+        # （publicationDate 可能是 in-press 的未来日期）。
+        # 有日期按日期判，没日期按年份判，两者都没有**保留**并标注。
+        lower, floor_year = year_window(args.years)
+
+        def _year_ok(r):
+            d = str(r.get("发表时间") or "").strip()
+            if len(d) >= 10:
+                try:
+                    from datetime import date as _d
+                    if _d.fromisoformat(d[:10]) >= lower:
+                        r["年份判定依据"] = "日期"
+                        return True
+                    r["年份判定依据"] = "日期"
+                    return False
+                except ValueError:
+                    pass
+            y = _num(r.get("年份"))
+            if y is None:
+                r["年份判定依据"] = "缺失"
+                return True
+            r["年份判定依据"] = "年份"
+            return y >= floor_year
+
+        conds.append((f"近{args.years}年(下界{lower})", _year_ok))
+
     if args.year_min is not None or args.year_max is not None:
         needed.append("年份")
         def f(r):
@@ -420,16 +477,23 @@ def apply_filters(rows, args, headers):
         conds.append((f"引用数>={args.min_citations}",
                       lambda r: (_num(r.get("引用数")) or -1) >= args.min_citations))
 
+    # 分区为空的行**单独记账**：它既不是「符合」也不是「分区等级不够」，
+    # 而是「未查到」。以前这类行被静默并进「分区不符」，事后无法分辨。
+    zone_empty = None
+
     if args.zone:
         ZONE_COL = "中科院分区"
         needed.append(ZONE_COL)
         want = {z.strip().replace("区", "") for z in str(args.zone).split(",") if z.strip()}
         if any(w.upper().startswith("Q") for w in want):
             raise SystemExit(
-                "[ERROR] 分区取值已改为中科院 1~4 区（如 --zone 1,2）。"
-                "Q1/Q2 属 JCR 口径，本 skill 不再提供 JCR 四分位（无免费数据源）。")
+                "[ERROR] --zone 取值是分区数字 1~4（如 --zone 1,2）。"
+                "标准由 --zone-basis 决定（jcr 或 xr），默认 jcr。")
+        zone_empty = sum(1 for r in rows
+                         if not str(r.get(ZONE_COL) or "").strip())
         conds.append((f"{ZONE_COL}∈{sorted(want)}区",
-                      lambda r: (str(r.get(ZONE_COL) or "").strip().replace("区", "")) in want))
+                      lambda r: (str(r.get(ZONE_COL) or "").strip()
+                                 .replace("区", "")) in want))
 
     if args.title_contains:
         needed.append("标题")
@@ -459,6 +523,8 @@ def apply_filters(rows, args, headers):
         before = len(cur)
         cur = [r for r in cur if fn(r)]
         audit.append((name, before - len(cur)))
+    if zone_empty is not None:
+        audit.append(("筛前分区为空(未查询到，已一并排除)", zone_empty))
     return cur, audit
 
 
@@ -587,30 +653,25 @@ def show_selected(path):
         print(m)
 
 
-# ---------------------------------------------------------------- ISSN 解析
-#
-# 实现已统一到 journal_quartile.py（那里是唯一维护点）：
-#   - resolve_issns()       刊名 → ISSN（Crossref 反查 + .issn_cache.json）
-#   - zone_map_for_journals() 刊名 → 中科院分区（ISSN 优先、刊名兜底）
-#
-# 为什么不在本模块重复实现：v3.0 之前 paper_table 与 semantic_scholar_search
-# 各有一套，前者按 ISSN、后者按刊名，同一份数据走两条路结果可能不同。
-from journal_quartile import resolve_issns, zone_map_for_journals  # noqa: F401
-
-
 # ---------------------------------------------------------------- 分区回填
+#
+# 实现已统一到 journal_quartile.py（那里是唯一维护点）。
+# **不再有 Crossref 反查 ISSN 这一步**：easyScholar 是按刊名查询的接口，
+# ISSN 只作归档加成，取自 S2 的 publicationVenue.issn。
+from journal_quartile import zone_map_for_journals  # noqa: F401
 
-def enrich_zone_column(path, out_path=None, refresh=False, verbose=True):
-    """查中科院《新锐期刊分区表》并回填「中科院分区」列。
 
-    为什么只查中科院分区、不查 JCR：见 journal_quartile 模块文档
-    （JCR 需 Web of Science/JCR 订阅，无免费数据源）。
+def enrich_zone_column(path, out_path=None, refresh=False, verbose=True,
+                       basis="jcr"):
+    """查期刊分区并回填「中科院分区」列（列名沿用历史叫法）。
+
+    标准由 `basis` 决定：`jcr`（默认）或 `xr`（中科院新锐）。easyScholar
+    一次返回多套分区，归档表四列都存，切换标准只换筛选参数。
 
     流程：
-      1) 按刊名去重，每本刊取一个 DOI
-      2) 无 ISSN 的刊 → Crossref 按 DOI 反查 ISSN（缓存 .issn_cache.json）
-      3) letpub_zone(issn=...) 优先，缺 ISSN 才退回刊名
-      4) 写 "1区"~"4区" / "未收录"，列强制文本格式
+      1) 按刊名去重
+      2) 有 ISSN 就作归档加成，没有就只用刊名（**不外部反查**）
+      3) 写 "1区"~"4区" / 未收录原因，列强制文本格式
     """
     from openpyxl import load_workbook
 
@@ -634,6 +695,7 @@ def enrich_zone_column(path, out_path=None, refresh=False, verbose=True):
         if verbose:
             print(f"[INFO] 表中原本没有「{ZONE_COL}」列，已在末尾新增")
     d_idx = headers.index("DOI") + 1 if "DOI" in headers else None
+    i_idx = headers.index("ISSN") + 1 if "ISSN" in headers else None
 
     targets = []                          # (行号, 刊名, DOI)
     for r in range(2, ws.max_row + 1):
@@ -658,11 +720,23 @@ def enrich_zone_column(path, out_path=None, refresh=False, verbose=True):
     for _, name, doi in targets:
         first_doi.setdefault(name, doi)
 
+    # ISSN 只取自表中已有的「ISSN」列（源头是 S2 的 publicationVenue.issn），
+    # 没有就纯按刊名查，**不做任何外部反查**。
+    issn_map = {}
+    if i_idx:
+        for r, name, _ in targets:
+            v = ws.cell(row=r, column=i_idx).value
+            v = str(v or "").strip()
+            if v and name not in issn_map:
+                issn_map[name] = v
+
     if verbose:
         print(f"待回填 {len(targets)} 行，涉及 {len(first_doi)} 种期刊"
-              f"（{'(全部重查)' if refresh else '(只补空值)'}）")
+              f"（{'(全部重查)' if refresh else '(只补空值)'}，"
+              f"标准 {basis}，带 ISSN {len(issn_map)} 种）")
 
-    zmap = zone_map_for_journals(first_doi, refresh=refresh, verbose=verbose)
+    zmap = zone_map_for_journals(first_doi, refresh=refresh, verbose=verbose,
+                                 issns=issn_map, basis=basis)
 
     filled = 0
     for r, name, _ in targets:
@@ -716,14 +790,20 @@ def main():
     g.add_argument("--selected", action="store_true", help="输出「选中」列勾选的 PaperID")
     g.add_argument("--from-json", metavar="JSON", help="从 json 生成 xlsx（一次性落盘）")
     g.add_argument("--enrich-zone", action="store_true",
-                   help="查中科院《新锐期刊分区表》并回填「中科院分区」列（ISSN 优先）")
+                   help="查期刊分区并回填「中科院分区」列（标准见 --zone-basis）")
     g.add_argument("--enrich-quartile", action="store_true", help=argparse.SUPPRESS)
 
+    ap.add_argument("--years", type=int, default=None,
+                    help="近 N 年（滑动窗口，下界=今天-N年，只设下界）；"
+                         "有发表时间按日期判，没有按年份判，两者都缺则保留")
+    ap.add_argument("--zone-basis", choices=["jcr", "xr"], default="jcr",
+                    help="分区标准：jcr（默认，JCR 四分位）或 xr（中科院新锐）")
     ap.add_argument("--year-min", type=int)
     ap.add_argument("--year-max", type=int)
     ap.add_argument("--min-citations", type=int)
     ap.add_argument("--zone",
-                    help="按中科院分区筛选，逗号分隔，如 1,2（也接受 1区,2区）")
+                    help="按分区筛选，逗号分隔，如 1,2（也接受 1区,2区）；"
+                         "标准由 --zone-basis 决定")
     ap.add_argument("--quartile", help=argparse.SUPPRESS)
     ap.add_argument("--title-contains")
     ap.add_argument("--venue-contains")
@@ -782,7 +862,7 @@ def main():
 
     if args.enrich_zone:
         enrich_zone_column(args.xlsx, out_path=args.out, refresh=args.refresh,
-                           verbose=not args.quiet)
+                           verbose=not args.quiet, basis=args.zone_basis)
         return
 
     headers, rows = read_table(args.xlsx)

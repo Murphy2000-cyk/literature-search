@@ -9,6 +9,13 @@ Semantic Scholar API 文献检索脚本 v1.4.0
 支持：多轮检索、API级筛选、分页、排序、JSON输出、引用网络扩展、集成分区查询
 """
 import sys
+# 控制台编码兜底：Windows 默认 GBK，打印中文/特殊字符会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import io
 
 # Windows GBK 编码兼容（仅在直接运行时启用，import 时不触发）
@@ -24,7 +31,7 @@ import requests
 import time
 import os
 import json
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
 
@@ -80,7 +87,7 @@ def resolve_save_dir(save_dir: Optional[str]) -> str:
 
 @dataclass
 class PaperInfo:
-    """论文信息"""
+    """论文信息（对应「数据种类清单」的七类数据）"""
     paper_id: str
     title: str
     authors: List[str]
@@ -95,6 +102,24 @@ class PaperInfo:
     is_preprint: bool = False
     quartile: str = ""
     relevance_score: float = 0.0
+    # 公开发表时间：优先 S2 的 publicationDate（YYYY-MM-DD），缺失则空
+    publication_date: str = ""
+    # 刊名取自哪个字段，便于事后核查回退链走到了哪一级
+    venue_source: str = ""
+    # ISSN 只取自 publicationVenue.issn，不向任何外部途径反查
+    issn: str = ""
+    # 关键词由 OpenAlex 在排序前补齐，S2 不提供此字段
+    keywords: str = ""
+    # 分区判定依据（jcr / xr）与状态
+    zone_basis: str = ""
+    zone_status: str = ""
+    # 摘要来源：S2 / OpenAlex / Elsevier / PubMed / 空
+    abstract_source: str = ""
+    # 是否命中记录合规规则：撤稿 / 版面元素 / 记录可疑
+    is_retracted: bool = False
+    is_layout_record: bool = False
+    is_suspicious: bool = False
+    record_reasons: str = ""
 
 
 class ApiUnavailableError(RuntimeError):
@@ -145,25 +170,122 @@ DEFAULT_PER_QUERY_LIMIT = 100
 #   save_papers_xlsx / search_pipeline 均已支持 None = 不截断（0 同义）。
 DEFAULT_TOTAL_LIMIT = None
 
-# ---------------------------------------------------------------- 检索请求字段
-# **把 DOI / 摘要 / OA 链接直接放进【检索】请求的 fields。**
+# ---------------------------------------------------------------- 请求字段（唯一定义）
+# 「数据种类清单」的 S2 侧字段，**只允许在这里定义一次**。
 #
-# 为什么（2026-09-20 实测）：旧版 fields 只有
-#     paperId,title,authors,year,venue,citationCount,publicationTypes
-# 没有 externalIds（DOI 在里面）也没有 abstract，
-# 于是"要交付的 N 篇"必须再逐篇调一次 /paper/{id} 补详情 —— 10 篇就是 10 次以上调用。
+# 历史教训（本文件旧版）：同一份字段串在五个地方各写一份，其中检索请求漏了
+# `journal` 与 `publicationVenue`，而解析函数也只读 `venue` —— 请求与解析
+# 两边完全自洽，所以永不报错，但大量刊名在 S2 侧明明有、本地却是空列。
+# 这类「自洽地错」只能靠 assert_fields_cover() 在启动时拦下。
 #
-# 实测（1 次请求，limit=100，查询 "external thermal insulation composite system
-# non-destructive testing"）：加上这三个字段后**同一次请求**即可带回
-#     DOI 88/100 (88%) · 摘要 74/100 (74%) · OA PDF 60/100 (60%)
-# 响应体积 214 KB，**调用次数 +0**。
-#
-# 代价：响应体积变大（原约 30~60 KB → 约 214 KB）。
-# 需要极简响应的场合可用 search_first_round(lite=True) 回到旧字段集。
+# 七类数据与字段的对应：
+#   题目 → title            关键词 → OpenAlex（S2 无此字段）
+#   DOI  → externalIds     作者   → authors
+#   期刊 → journal / publicationVenue / venue（三级回退）
+#   摘要 → abstract         发表时间 → publicationDate / year
+S2_FIELDS_LIST = [
+    "paperId", "title", "externalIds", "authors",
+    "journal", "publicationVenue", "venue",
+    "abstract", "publicationDate", "year",
+    "citationCount", "publicationTypes", "openAccessPdf",
+]
+S2_FIELDS = ",".join(S2_FIELDS_LIST)
+
+# 解析函数实际读取的字段集合。新增读取项时必须同步加进 S2_FIELDS_LIST，
+# 否则 assert_fields_cover() 会抛错。
+PARSED_FIELDS = set(S2_FIELDS_LIST)
+
+
+def assert_fields_cover(fields: str, need: Optional[set] = None) -> None:
+    """字段存在性断言：请求的字段必须覆盖解析要读取的字段。
+
+    **只校验键是否存在，绝不校验值是否为空。**
+    键不存在 = 代码 bug（请求参数漏了字段名），启动即抛错；
+    键存在但值为空 = 数据事实（这篇论文确实没有），走回退链并保留行。
+
+    不设「某字段空值率超过 X% 就中止」这类闸门 —— 空值率可以进完整性报告，
+    不能当作准入条件，否则老文献会因为没摘要而让整次检索失败。
+    """
+    need = PARSED_FIELDS if need is None else need
+    got = {f.strip().split(".")[0] for f in fields.split(",") if f.strip()}
+    missing = need - got
+    if missing:
+        raise AssertionError(
+            "请求字段未覆盖解析字段，缺少：" + str(sorted(missing))
+            + "。请补进 S2_FIELDS_LIST，不要在调用处临时拼字段串。")
+
+
+# 兼容旧名：lite 检索只要这几个字段；其余场合一律用 S2_FIELDS
 DETAIL_FIELDS = "externalIds,abstract,openAccessPdf"
-SEARCH_FIELDS = ("paperId,title,authors,year,venue,citationCount,"
-                 "publicationTypes")
-SEARCH_FIELDS_FULL = SEARCH_FIELDS + "," + DETAIL_FIELDS
+SEARCH_FIELDS = "paperId,title,authors,year,venue,citationCount,publicationTypes"
+SEARCH_FIELDS_FULL = S2_FIELDS
+
+
+# 按 ID 复取摘要用的窄字段集。**不要拿它喂 _parse_paper** ——
+# 它不含 journal/publicationVenue，会触发字段存在性断言；这里只拼字典。
+ROUND2_FIELDS = "paperId,abstract,externalIds,openAccessPdf"
+
+
+def resolve_venue(item: Dict) -> Tuple[str, str]:
+    """取刊名：journal.name → publicationVenue.name → venue。
+
+    三级都空时返回 ("", "")，由上层标「刊名为空」。
+    **只在 S2 响应内部回退**，不向 Crossref 或任何外部途径反查。
+
+    Returns:
+        (刊名, 来源字段名)
+    """
+    journal = item.get("journal") or {}
+    name = (journal.get("name") or "").strip()
+    if name:
+        return name, "journal.name"
+
+    pv = item.get("publicationVenue") or {}
+    name = (pv.get("name") or "").strip()
+    if name:
+        return name, "publicationVenue.name"
+
+    name = (item.get("venue") or "").strip()
+    if name:
+        return name, "venue"
+
+    return "", ""
+
+
+def venue_issn(item: Dict) -> str:
+    """ISSN 只取自 publicationVenue.issn，取不到就空，不外部反查。"""
+    pv = item.get("publicationVenue") or {}
+    return (pv.get("issn") or "").strip()
+
+
+def year_window(years: int = 10, today: Optional[date] = None) -> Tuple[date, int]:
+    """「近 N 年」窗口：返回精确下界日期与下界年份。
+
+    下界 = 今天 - N 年（精确到日）。**只设下界、不设上界**：publicationDate
+    可能是 in-press 的未来日期，硬卡上界会把正常论文误删。
+
+    注意 S2 的 `year` 参数只能按年传（`year=A-B`），表达不了「2016-11-02」，
+    所以请求端按年份放宽、本地再按日期精确裁。
+
+    Returns:
+        (下界日期, 下界年份)
+    """
+    today = today or date.today()
+    try:
+        lower = today.replace(year=today.year - years)
+    except ValueError:
+        # 2 月 29 日遇到非闰年
+        lower = today.replace(year=today.year - years, day=28)
+    return lower, lower.year
+
+
+def _classify_record(**kwargs) -> Dict:
+    """调 venue_rules 判记录类别；模块缺失或未实现时退化为空判定（不阻断检索）。"""
+    try:
+        from venue_rules import classify_record
+        return classify_record(**kwargs) or {}
+    except Exception:
+        return {}
 
 # ---------------------------------------------------------------- 关键词上限
 # **单条查询最多几个关键词（用户 2026-09-20 指定：5 个）。**
@@ -181,7 +303,7 @@ ROUNDS_MAX = 4
 # 每轮默认取回篇数（用户 2026-10-30 指定：500 = **5 页**，每页 100 是平台硬上限）。
 # 一次"取 500 篇"在接口层是 **5 次请求**（offset 0/100/200/300/400），不是 1 次。
 # 请求总量 = ceil(每轮篇数/100) × 轮数；4 轮 500 篇 = 20 次请求。
-DEFAULT_PER_ROUND = 500
+DEFAULT_PER_ROUND = 300
 
 
 def check_keyword_count(query: str, max_keywords: int = MAX_KEYWORDS,
@@ -253,7 +375,17 @@ class SemanticScholarSearcher:
         # 2026-09-20 用户指定由 2.5 提到 **4.0**：实测 2.5 秒下连续两次 429，
         # 靠 10 秒重试才成功；新标准流程一轮检索只需 6~8 次请求，
         # 把间隔放宽到 4 秒换取更少重试，整体反而更快也更稳。
-        self.REQUEST_INTERVAL = 4.0
+        # 请求间隔。默认 4.0 秒；可用环境变量 LITSEARCH_REQUEST_INTERVAL 覆盖。
+        # 为什么要可调：实测同一个 key 在 4 秒间隔下仍会在第 6~9 次请求撞 429，
+        # 说明有效配额低于官方文档的"1 请求/秒"。间隔调到 8~12 秒能跑完整轮。
+        try:
+            self.REQUEST_INTERVAL = float(
+                os.getenv("LITSEARCH_REQUEST_INTERVAL", "4.0"))
+        except ValueError:
+            self.REQUEST_INTERVAL = 4.0
+        # ⚠️ 这一个计时器是**全局**的：_rate_limit() 在 _make_request 里被所有端点共用，
+        # 所以 /paper/search、/paper/batch、/paper/{id} 共享同一个间隔。
+        # 这正是官方要求的行为（1 RPS 全端点），**不要**改成按端点分别计时。
         # 失败重试策略（v1.4.0，用户指定）：
         #   首次尝试 → 等 10s → 第 2 次 → 等 10s → 第 3 次 → 仍失败则停止
         # 三次均失败即抛 ApiUnavailableError，**立即暂停检索**并向用户提问：
@@ -264,7 +396,11 @@ class SemanticScholarSearcher:
         #   （静默 60s 后仍 429，静默 44s 后自行恢复 200）。
         #   因此秒级退避必然三次全败，继续自动重试没有意义；只有分钟级等待才可能成功。
         # 绝不切换匿名请求，绝不无限重试。
-        self.RETRY_WAITS_S = (10, 10)
+        # **官方要求指数退避**（S2 release notes 从 2024-03 起每月重申：
+        # "we now require the use of exponential backoff strategies"）。
+        # 10 → 20 → 40 秒，累计约 70 秒，正好覆盖官方与实测的 60~110 秒封锁窗口；
+        # 固定 10/10 的问题在于两次都落在封锁期内，必然全败。
+        self.RETRY_WAITS_S = (10, 20, 40)
         # 用户在"持续等待"分支下选择等待时的静默秒数（3~5 分钟取中值）
         self.LONG_WAIT_S = 240
         # 仅在用户明确选择"持续等待"后由调用方置 True：
@@ -272,6 +408,8 @@ class SemanticScholarSearcher:
         self.long_wait_on_failure = False
         self.failures = 0            # 连续失败次数（诊断用）
         self.last_failure = ""       # 最近一次失败原因（诊断用）
+        self.last_failed_endpoint = ""   # 最近一次失败的端点（诊断用）
+        self.raw_sink = None              # 原始响应落盘钩子：(url, params, payload) -> None
         self.diagnostics = []        # 逐查询留痕，供"如实汇报"使用
         self.partial_papers = {}     # 查询中断前已取回的部分结果，避免随异常丢失
 
@@ -334,7 +472,15 @@ class SemanticScholarSearcher:
 
             if response is not None:
                 if response.status_code == 200:
-                    return response.json()
+                    payload = response.json()
+                    # 第 0 层：原始响应全量落盘。钩子由调用方设置，
+                    # 未设置时不影响任何行为。
+                    if getattr(self, "raw_sink", None):
+                        try:
+                            self.raw_sink(url, params, payload)
+                        except Exception as _e:
+                            print(f"[WARN] 原始响应落盘失败：{_e}")
+                    return payload
                 if response.status_code in (429, 401, 403) or response.status_code >= 500:
                     # 限流 / 密钥被拒 / 服务端 5xx（如 504 网关超时）都按可重试处理
                     reason = f"HTTP {response.status_code}（{response.text[:120]}）"
@@ -348,6 +494,13 @@ class SemanticScholarSearcher:
 
             self.failures += 1
             self.last_failure = reason
+            # 记下失败的端点：限流按端点施加（实测同一时刻 /paper/search 返回 200
+            # 而 /paper/{id} 返回 429），所以报告必须能区分「哪个端点挂了」，
+            # 不能只报一句"S2 不可用"。
+            try:
+                self.last_failed_endpoint = "/" + url.split("/graph/v1/", 1)[1]
+            except Exception:
+                self.last_failed_endpoint = url
             if attempt < len(waits):
                 wait_time = waits[attempt]
                 print(f"[RETRY] 第 {attempt + 1}/{total_attempts} 次失败：{reason}；"
@@ -359,7 +512,10 @@ class SemanticScholarSearcher:
         raise ApiUnavailableError(
             f"Semantic Scholar 连续 {total_attempts} 次请求均失败"
             f"（依次等待 {'/'.join(str(w) for w in waits)}s 后仍失败）。\n"
+            f"失败端点：{getattr(self, 'last_failed_endpoint', '未知')}\n"
             f"最近原因：{reason}\n"
+            f"注意：S2 的配额是**全端点共享 1 RPS**（官方口径），"
+            f"换端点不能绕过限流，只能退避等待。\n"
             f"\n"
             f"【已暂停检索】不要自行继续重试，不要改用匿名请求，不要遍历剩余查询。\n"
             f"【必须立即向用户提出以下二选一问题（按用户偏好排序）】\n"
@@ -367,9 +523,11 @@ class SemanticScholarSearcher:
             f"把 long_wait_on_failure 置为 True 后重跑）；\n"
             f"    2) 降级使用 Crossref 备用源（**最后手段**；代价：只能检索到有 DOI 的文献，"
             f"存在系统性覆盖缺口）。\n"
-            f"【实测依据 2026-09-11】S2 触发限流后会进入约 60~110 秒的封锁期，"
-            f"封锁期内任何请求都是 429：静默 60s 后仍 429，静默 44s 后自行恢复 200。"
-            f"限流由 AWS API Gateway 按 API key 施加，key 本身有效（伪造 key 返回 403 而非 429）。"
+            f"【官方口径】带 key 的配额是 **1 RPS、全端点**，且高峰期会被进一步压制；"
+            f"官方明确要求使用指数退避。\n"
+            f"【实测依据】限流触发后进入约 60~110 秒封锁期，期内任何请求都是 429。"
+            f"限流由 AWS API Gateway 按 API key 施加，key 本身有效"
+            f"（封锁期内伪造 key 返回 403 而非 429，说明鉴权先于限流）。"
         )
 
     def search_first_round(
@@ -657,9 +815,7 @@ class SemanticScholarSearcher:
         all_result = {}
         for i in range(0, len(paper_ids), 500):
             batch_ids = paper_ids[i:i+500]
-            params = {
-                "fields": "paperId,abstract,externalIds,openAccessPdf"
-            }
+            params = {"fields": ROUND2_FIELDS}
             json_data = {"ids": batch_ids}
 
             data = self._make_request(self.BATCH_URL, params=params, json_data=json_data)
@@ -699,12 +855,8 @@ class SemanticScholarSearcher:
             return []
 
         if fields is None:
-            fields = [
-                "paperId", "title", "authors", "year", "venue",
-                "citationCount", "publicationTypes", "abstract",
-                "externalIds", "openAccessPdf", "references.paperId",
-                "citations.paperId"
-            ]
+            # 与 S2_FIELDS 同源，另加引用/参考文献的 paperId
+            fields = S2_FIELDS_LIST + ["references.paperId", "citations.paperId"]
 
         fields_str = ",".join(fields)
 
@@ -718,7 +870,12 @@ class SemanticScholarSearcher:
             params = {"fields": fields_str}
             json_data = {"ids": batch_ids}
 
-            data = self._make_request(self.BATCH_URL, params=params, json_data=json_data)
+            # ⚠️ 这里**不做拆批重试**。原因有两条：
+            #   1) 限流期是分钟级，拆批等于在封锁期内把请求数翻倍，只会延长封锁；
+            #   2) 项目已定规则：失败走统一的重试与上报，由用户决定等待还是换源。
+            # `/paper/batch` 单次最多 500 个 ID，这是接口上限，与检索的每轮 300 篇无关。
+            data = self._make_request(self.BATCH_URL, params=params,
+                                      json_data=json_data)
             if not data:
                 continue
 
@@ -743,11 +900,7 @@ class SemanticScholarSearcher:
             论文详情字典，包含 citations 和 references 列表
         """
         url = f"{self.BASE_URL}/paper/{paper_id}"
-        params = {
-            "fields": "paperId,title,authors,year,venue,citationCount,"
-                      "publicationTypes,abstract,externalIds,openAccessPdf,"
-                      "citations,references"
-        }
+        params = {"fields": S2_FIELDS + ",citations,references"}
         return self._make_request(url, params=params)
 
     def expand_citations(
@@ -797,13 +950,18 @@ class SemanticScholarSearcher:
         return list(expanded.values())
 
     def _parse_paper(self, item: Dict) -> PaperInfo:
-        """解析论文数据，使用 API 的 publicationTypes 字段"""
+        """解析论文数据。
+
+        「期刊信息」按 journal.name → publicationVenue.name → venue 三级回退，
+        **只在 S2 响应内部回退，不走任何外部途径**。三级都空则置空并记下来源，
+        由上层标「刊名为空」——不删行，因为刊名缺失不等于这篇论文不合格。
+        """
         authors = [a.get("name", "") for a in item.get("authors", [])]
         external_ids = item.get("externalIds", {}) or {}
-        doi = external_ids.get("DOI", "")
+        doi = external_ids.get("DOI", "") or ""
         open_access = item.get("openAccessPdf")
         pdf_url = open_access.get("url", "") if open_access else ""
-        venue = item.get("venue", "")
+        venue, venue_source = resolve_venue(item)
 
         # 使用 API 的 publicationTypes 字段判断（替代关键词判断）
         pub_types = item.get("publicationTypes", []) or []
@@ -817,19 +975,35 @@ class SemanticScholarSearcher:
             preprint_markers = ["arxiv", "ssrn", "research square", "biorxiv", "medrxiv", "preprint"]
             is_preprint = any(m in venue_lower for m in preprint_markers)
 
+        title = item.get("title", "") or ""
+        abstract = item.get("abstract", "") or ""
+        cls = _classify_record(
+            title=title, venue=venue, publication_types=pub_types,
+            external_ids=external_ids, doi=doi, abstract=abstract,
+            year=item.get("year") or 0,
+        )
+
         return PaperInfo(
             paper_id=item.get("paperId", ""),
-            title=item.get("title", ""),
+            title=title,
             authors=authors,
-            year=item.get("year", 0),
+            year=item.get("year") or 0,
             venue=venue,
-            citation_count=item.get("citationCount", 0),
-            abstract=item.get("abstract", "") or "",
+            citation_count=item.get("citationCount", 0) or 0,
+            abstract=abstract,
             doi=doi,
             pdf_url=pdf_url,
-            is_conference=is_conference,
+            is_conference=bool(is_conference or cls.get("is_conference")),
             is_journal=is_journal,
-            is_preprint=is_preprint
+            is_preprint=bool(is_preprint or cls.get("is_preprint")),
+            publication_date=item.get("publicationDate", "") or "",
+            venue_source=venue_source,
+            issn=venue_issn(item),
+            abstract_source="S2" if abstract else "",
+            is_retracted=bool(cls.get("is_retracted")),
+            is_layout_record=bool(cls.get("is_layout_record")),
+            is_suspicious=bool(cls.get("is_suspicious")),
+            record_reasons=";".join(cls.get("reasons") or []),
         )
 
     def get_stats(self) -> Dict:
@@ -837,18 +1011,20 @@ class SemanticScholarSearcher:
         return {"total_requests": self.request_count}
 
 
-def enrich_quartiles(papers: List[PaperInfo], refresh: bool = False) -> List[PaperInfo]:
-    """按中科院《新锐期刊分区表》回填 paper.quartile（值为 "1"~"4" 或 ""）。
+def enrich_quartiles(papers: List[PaperInfo],
+                     refresh: bool = False,
+                     basis: str = "jcr") -> List[PaperInfo]:
+    """按指定分区标准回填 paper.quartile（值为 "1"~"4" 或 ""）。
 
-    为什么不是 JCR：JCR（Clarivate，基于 JIF）没有免费数据源——需 Web of Science /
-    JCR 订阅，Clarivate API 付费，LetPub 检索页也不显示 JCR 四分位。第三方自算的四分位
-    不能当 JCR 用。详见 journal_quartile 模块文档。
+    分区数据来自 easyScholar 的 `getPublicationRank`，它同时返回中新锐与 JCR
+    多套分区，所以标准由 `basis` 决定，不写死：
+        "jcr" → JCR 四分位（默认）
+        "xr"  → 中科院《新锐期刊分区表》
 
     流程：
-    1. 按刊名去重，每本刊取一个 DOI
-    2. 无 ISSN 的 → Crossref 按 DOI 反查 ISSN（缓存 .issn_cache.json）
-    3. letpub_zone(issn=...) 优先，缺 ISSN 才退回刊名
-    4. 写回 paper.quartile
+    1. 按刊名去重（easyScholar 是刊名查询接口，不需要 ISSN）
+    2. 有 ISSN 的作加成传给 journal_quartile，没有就只用刊名
+    3. 写回 paper.quartile，并记录 zone_basis / zone_status
     """
     from journal_quartile import zone_map_for_journals
 
@@ -858,19 +1034,25 @@ def enrich_quartiles(papers: List[PaperInfo], refresh: bool = False) -> List[Pap
         if v and v not in venue_doi:
             venue_doi[v] = (p.doi or "")
 
-    print(f"\n[ZONE] Looking up {len(venue_doi)} unique journals (中科院新锐分区)...")
-    # 与 paper_table.enrich_zone_column 走**同一个**入口（ISSN 优先 + 刊名兜底），
-    # 避免两条路径口径不一致。
-    zone_map = zone_map_for_journals(venue_doi, refresh=refresh, verbose=True)
+    print(f"\n[ZONE] Looking up {len(venue_doi)} unique journals "
+          f"(zone_basis={basis})...")
+    zone_map = zone_map_for_journals(venue_doi, refresh=refresh,
+                                     verbose=True, basis=basis)
 
     for p in papers:
         p.quartile = zone_map.get((p.venue or "").strip()) or ""
+        p.zone_basis = basis
+        p.zone_status = "已收录" if p.quartile else "未收录"
 
     return papers
 
 
 def _default_year_range() -> Tuple[int, int]:
-    """默认年份范围：近10年"""
+    """默认年份范围：近 10 年（按年份粗算）。
+
+    ⚠️ 仅保留给旧调用方。新流程请用 `year_window(years)`，它返回**精确到日**
+    的下界，并能处理「只设下界、不设上界」与年份缺失保留这两条标准。
+    """
     this_year = datetime.now().year
     return (this_year - 9, this_year)
 
@@ -940,12 +1122,13 @@ def filter_papers(
         if paper_type == "conference_only" and not paper.is_conference:
             continue
         if quartile_filter:
-            # 分区取值已改为中科院 1~4 区；传 Q1/Q2 属旧 JCR 口径，必须显式拦下，
+            # 分区取值已改为中科院 1~4 区；传 Q1/Q2 属旧 JCR 标准，必须显式拦下，
             # 否则会静默筛成空表（"看起来该领域没论文"）。
             if any(str(x).upper().startswith("Q") for x in quartile_filter):
                 raise ValueError(
-                    "quartile_filter 取值已改为中科院分区 1~4（如 ['1','2']）；"
-                    "Q1/Q2 属 JCR 口径，本 skill 不再提供 JCR 四分位（无免费数据源）。")
+                    "quartile_filter 取值是分区数字 1~4（如 ['1','2']），"
+                    "不接受 Q1/Q2 这种写法。标准由 zone_basis 决定"
+                    "（jcr 或 xr），默认 jcr。")
             if paper.quartile and paper.quartile not in quartile_filter:
                 continue
         filtered.append(paper)

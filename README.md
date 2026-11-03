@@ -1,10 +1,22 @@
 # literature-search
 
-`literature-search` 是用于文献检索的 skill，以 **Semantic Scholar** 为主数据源。通过内置的 BGE 模型对数据进行筛选和排序，根据用户需求返回学术文献。大模型只会接收到「检索、筛选、排序」后的最终数据，因此极大程度地节约了 token 消耗。当前版本 **v2.0.1**。`SKILL.md` 遵循 **Agent Skills** 规范，frontmatter 只有 `name` 和 `description` 两个字段，所以**文件格式本身不需要改**就能装到 DSH 以外的智能体（Agent）；要调整的是装到哪里、Key 放哪、以及一个可选的外部命令，见 [INSTALL.md 第七节](INSTALL.md#七装到-dsh-以外的-agent)。
+## v2.2.0 要点
+
+- **六个环节**：原始检索 → 去重 → 近 N 年 → 记录合规 → 期刊等级 → BGE 排序，每环节一份 Excel。
+- **第 0 层原始落盘**：每次 S2 请求的原始响应存进 `<输出目录>/raw/r{n}_p{n}.json`，
+  不裁剪不丢记录，是全部表的权威源。
+- **领域开关**：`--domain cs` 默认放行单篇会议论文（计算机以会议为主）；
+  其它领域用默认 `general`（排除会议论文）。撤稿与会议录卷级条目永不放行。
+- **淘汰原因分两类**：`不符合条件`（有数据但不满足）与 `无数据可判`（缺字段不纳入），
+  分开统计，写进 `筛选淘汰记录.xlsx`。
+- **分区默认 JCR 1 区**（`--zone-basis jcr|xr` 可切中科院新锐），时间默认近 10 年。
+- **摘要非硬性**，六类必得字段（题目/DOI/作者/期刊/发表时间/关键词）缺失会在报告里列出。
+
+`literature-search` 是用于文献检索的 skill，以 **Semantic Scholar** 为主数据源。通过内置的 BGE 模型对数据进行筛选和排序，根据用户需求返回学术文献。大模型只会接收到「检索、筛选、排序」后的最终数据，因此极大程度地节约了 token 消耗。当前版本 **v2.2.0**。`SKILL.md` 遵循 **Agent Skills** 规范，frontmatter 只有 `name` 和 `description` 两个字段，所以**文件格式本身不需要改**就能装到 DSH 以外的智能体（Agent）；要调整的是装到哪里、Key 放哪、以及一个可选的外部命令，见 [INSTALL.md 第七节](INSTALL.md#七装到-dsh-以外的-agent)。
 
 **English**
 
-`literature-search` is a literature-retrieval skill for **DeepSeek Harness (DSH)**. It searches academic literature on **Semantic Scholar** as its primary data source, then uses a built-in BGE model to score and rank the candidates and filters them by a topic gate plus the user's requirements, so the model only ever receives the final retrieved, filtered and ranked data. That saves a large amount of tokens. Current version: **v2.0.1**. Its `SKILL.md` follows the **Agent Skills** spec (the frontmatter carries only `name` and `description`), so the file format itself needs no change to run on hosts other than DSH. What does need adjusting is where to install it, where the API keys live, and one optional external command; see section 7 of [INSTALL.md](INSTALL.md).
+`literature-search` is a literature-retrieval skill for **DeepSeek Harness (DSH)**. It searches academic literature on **Semantic Scholar** as its primary data source, then uses a built-in BGE model to score and rank the candidates and filters them by year, record type and journal quartile, so the model only ever receives the final retrieved, filtered and ranked data. That saves a large amount of tokens. Current version: **v2.2.0**. Its `SKILL.md` follows the **Agent Skills** spec (the frontmatter carries only `name` and `description`), so the file format itself needs no change to run on hosts other than DSH. What does need adjusting is where to install it, where the API keys live, and one optional external command; see section 7 of [INSTALL.md](INSTALL.md).
 
 ---
 
@@ -33,12 +45,12 @@
 这个 skill 的做法是：
 
 1. 基于 Semantic Scholar 的 API 获得数据；
-2. 3–4 轮每轮 ≤5 个词的关键词，每轮取 500 篇，**一次检索需 15～20 次 Semantic Scholar 请求**；
+2. 3–4 轮每轮 ≤5 个词的关键词，每轮取 300 篇，**一次检索需 9～12 次 Semantic Scholar 请求**；
    检索响应本身已直接带回 DOI（覆盖 88–95%）、摘要（74%）、OA 链接，**不需要再逐篇补详情**；
 3. 全部元数据一次性写进**一个 xlsx**，数据在脚本里流转，**只有 stdout 进上下文**。
    实测"筛出 1 区里最相关的前 10 篇"这条命令的 stdout **只有 2 行 ≈ 47 token**，
    而整表进上下文要 ≈ 9.7 万 token；
-4. 通过 BGE 进行相关性排序，并且设置了**主题闸门**和**用户需求**作为筛选条件，返回最终数据。
+4. 按年份、记录类型与期刊等级逐级筛选，再通过 BGE 做相关性排序，返回最终数据。
 
 ---
 
@@ -46,51 +58,58 @@
 
 | 环节 | 做什么 | 产物 |
 |---|---|---|
-| **检索** | 3–4 轮 ≤5 词关键词，每轮 500 篇（5 页）→ 合并去重 | 候选池 |
-| **排序** | BGE 对**每组关键词独立评分**（绝不用别组关键词打分）→ 合并降序 | 带 BGE 分的表 |
-| **主题闸门** | 按本次题目配置的 2–3 个轴（每轴约 50 词）过滤；自带"过窄自检" | 领域内候选 |
-| **落盘** | 全部元数据一次写成 xlsx（含 DOI / 摘要 / PDF 链接 / 分区） | `<前缀>.xlsx` |
+| **检索** | 4 轮 ≤5 词关键词，每轮 300 篇（3 页），**不设年份限制** | 原始候选池 |
+| **六环节流水线** | 原始检索 → 去重 → 近 N 年 → 记录合规 → 期刊等级 → 排序，逐环落盘 | 六份逐级递减的表 |
+| **排序** | BGE 用**一句英文主题描述**整句打分，标题 0.6 + 关键词 0.4，摘要不参与 | 带 BGE 分的表 |
+| **记录合规** | 剔除会议论文、会议录卷级条目、预印本、撤稿；标记版面元素与记录可疑 | 合规候选 |
+| **分区** | `journal_quartile.py` 查 easyScholar，**默认 JCR 1 区**，结果落 `data/journal_zone.xlsx` | 带分区与查询日期的表 |
+| **落盘** | 全部元数据一次写成 xlsx（含 DOI / 摘要 / PDF 链接 / 分区 / 淘汰原因） | `<前缀>.xlsx` |
 | **按需读取** | `--stats` / `--filter` / `--select` / `--top-n` / `--quiet` / `--selected` | 只把需要的一小部分读进上下文 |
-| **分区回填** | `--enrich-zone` 查中科院新锐分区（LetPub，1–4 区）并写回表里 | 带分区的表 |
 | **备用源** | Semantic Scholar 不可用时，**经用户同意后**启用 Crossref（带硬门禁） | 备用结果 |
-| **摘要补全** | `abstract_fill.py`：Crossref → OpenAlex → **Elsevier API** → PubMed → 页面渲染，五源逐级兜底 | 带「摘要来源」的表 |
+| **摘要补全** | S2 原生 → OpenAlex → **Elsevier API** → PubMed，逐档降级，仍缺则标「无摘要」 | 带「摘要来源」的表 |
 | **会议识别** | `venue_rules.py`：按刊名规则识别标成 JournalArticle 的会议论文集（带正规期刊白名单） | 带「疑似会议」列的表 |
-| **如实汇报** | 每次检索自动产出**检索完整性报告**（哪些查询失败/截断） | `检索完整性报告.txt/.json` |
+| **如实汇报** | 每次检索自动产出**检索完整性报告**与**筛选淘汰记录** | `检索完整性报告.txt/.json`、`筛选淘汰记录.xlsx` |
 
 **模块一览**
 
 | 文件 | 职责 |
 |---|---|
-| `semantic_scholar_search.py` | 主流程：检索、分页、合并去重、筛选、分区集成、保存；含失败重试与上报 |
-| `search_pipeline.py` | **一步流程**：检索 → BGE 每组独立评分 → 合并排序 → 落盘 Excel |
+| `search_pipeline.py` | **六环节编排入口**：检索 → 去重 → 近 N 年 → 记录合规 → 期刊等级 → 排序，返回各环节产物路径 |
+| `semantic_scholar_search.py` | 检索与筛选：分页、合并去重、失败重试与上报、检索完整性报告；含 S2 SDK 封装 |
+| `keyword_fetch.py` | OpenAlex 按 DOI 批量取关键词与摘要（S2 无 `keywords` 字段，请求会 400） |
 | `paper_table.py` | 元数据表落盘与按需读取（`--select` / `--top-n` / `--quiet` / `--enrich-zone`） |
-| `relevance_scorer.py` | BGE 多组关键词相关性排序（`rank_groups()` 每组独立评分后全局排序） |
-| `topic_gate.py` | **主题闸门**：判断标题+摘要是否属于目标领域，含过窄自检 |
+| `relevance_scorer.py` | BGE 相关性排序，主用 `rank_topic()` 单句主题描述；`rank_groups()` 保留兼容 |
+| `journal_quartile.py` | 分区查询（easyScholar 主通道，默认 JCR 四分位），结果归档到 `data/journal_zone.xlsx` |
+| `venue_rules.py` | 会议论文集识别：刊名规则 + 正规期刊白名单 |
+| `abstract_fill.py` | 摘要补全后两档：Elsevier + PubMed |
 | `paper_details.py` | Phase 2：按 paper_id / 标题批量取详情 |
 | `translator.py` | 批量翻译标题与摘要（可选，缺凭据自动跳过并保留英文） |
-| `journal_quartile.py` | 中科院《新锐期刊分区表》查询（LetPub，带本地缓存与 TTL） |
 | `crossref_fallback.py` | 备用数据源（未获用户同意会直接拒绝执行，退出码 3） |
-| `abstract_fill.py` | **摘要补全**：五源逐级兜底，回填「摘要」列并记录「摘要来源」 |
-| `venue_rules.py` | **会议论文集识别**：刊名规则 + 正规期刊白名单 |
+| `topic_gate.py` | 主题闸门（**已取消接入流水线**，文件保留） |
 | `bge_status.py` | 查看本机 BGE 内存占用、区分中英文分支 |
-| `evals/` | 失败重试策略、如实汇报留痕、备用源门禁的自测套件 |
+| `evals/` | 失败重试策略、如实汇报留痕、备用源门禁、摘要补全、会议识别的自测套件 |
 
 ---
 
 ## 检索流程
 
-### 标准流程（默认，一步到位）
+### 标准流程（六环节，一次跑完）
 
 ```
-① 设 3~4 组英文关键词，每组 ≤5 个词，互为微调变体
-     每轮取 500 篇（= 5 页）→ 候选池最多 组数 × 500（3 组 → 最多 1500）
-② BGE 对【每一组各自】评分 → 合并去重 → 按分全局降序 → 取前 200
-③ 过主题闸门（2~3 个轴，命中全部轴才通过）
-④ 一次性落盘成一个 xlsx
-⑤ 之后按需读取，绝不整表进上下文
+① 设 4 组英文关键词，每组 ≤5 个词，互为微调变体，检索阶段不设年份限制
+     每轮取 300 篇（= 3 页），4 组 → 候选池最多 1200 篇
+② 按 paperId 去重，记录命中轮次与命中轮数
+③ 近 N 年（默认 10 年）：只设下界，精确到日；无日期且无年份的排除
+④ 记录合规：剔除会议论文、会议录卷级条目、预印本、撤稿
+⑤ 期刊等级：easyScholar 查分区，默认保留 JCR 1 区
+⑥ 排序：OpenAlex 取关键词 → BGE 用一句主题描述打分 → 补 Elsevier/PubMed 摘要
 ```
 
-**Semantic Scholar API 调用预算** = `ceil(每轮篇数 / 100) × 轮数`。默认即 `5 × 3~4 = 15~20 次请求`（外加少量 429 重试）。
+每环节落一份 Excel，行数逐级递减；另出 `筛选过程记录.md`（各环节进出与淘汰原因分类）与
+`筛选淘汰记录.xlsx`（逐条淘汰原因，可直接筛「淘汰环节」列）。
+
+**Semantic Scholar API 调用预算** = `ceil(每轮篇数 / 100) × 轮数`。默认即 `3 × 4 = 12 次请求`
+（外加少量 429 重试）。检索阶段不设年份，改年份窗口只动参数，不重花配额。
 
 ### 为什么是「短关键词」
 
@@ -107,24 +126,26 @@
 因此**单条查询最多 5 个关键词**（代码里 `check_keyword_count()` 会直接抛 `ValueError`），
 **不做探针轮**（探针既费调用数，又可能把 key 推进 429 封锁期）。
 
-### 为什么 BGE 排序之后还要过闸门
+### 为什么排序之后仍要人工复核
 
-BGE 打分是「标题向量 与 查询词向量 的余弦相似度**均值**」，它奖励的是**用词重合**，
-不是"这篇论文是否真做这个题目"。实测后果：一篇与题目无关的纯综述被排到第 2（BGE 0.6480），
-而三篇真正对题的论文反被压到 18 / 25 / 33 名。
+BGE 打分本质是**词面相似度**，奖励的是用词重合，不等于「这篇论文是否真做这个题目」。实测后果：
+一篇与题目无关的纯综述被排到第 2（BGE 0.6480），而三篇真正对题的论文反被压到 18 / 25 / 33 名。
 
-所以排序之后必须再加两道：
+v2.2.0 起排序改用**一句主题描述整句编码**，比逐词求均值稳，但仍有三处要人工兜住：
 
-1. **主题闸门**：为**本次题目**准备一条 profile：**2–3 个轴、每轴约 50 词，命中全部轴才通过**。
-   内置的两套 profile 只是**结构示例**，正式检索前必须另建。
-   实测：一套只适配某个题目的词表拿去判别的题目，13 个真实标题只过 3 个。
-2. **人工复核**：闸门后仍可能有别领域的撞名论文排在前排。
+1. **查询词外溢**：S2 是词面匹配，`× non-destructive testing` 这类组合会把整类方法召回。
+   拿到表后先看前 30 篇标题，必要时按「命中轮次」列只保留命中窄查询的记录。
+2. **分区未收录**：第 5 环节会因「该刊未被分区库收录」排除一批，其中可能有个别本属 1 区。
+   汇报时必须说明这批数量，不能当成「没有相关文献」。
+3. **主题闸门已下线**：`topic_gate.py` 只保留文件，不再参与流水线，不要照旧文档去配 profile。
 
 ---
 
 ## 安装（DSH）
 
-> 完整安装步骤、两个 API Key 的申请地址与常见问题，见 **[INSTALL.md](INSTALL.md)**。
+> 完整安装步骤、API Key 的申请地址与常见问题，见 **[INSTALL.md](INSTALL.md)**。
+> 需要自己申请三个 Key：`SEMANTIC_SCHOLAR_API_KEY`（必需）、`EASYSCHOLAR_SECRET_KEY`（分区必需）、
+> `ELS_API_KEY`（可选，只影响 Elsevier 摘要）。
 
 DSH 的 skill 发现深度**只有一层**，必须是 `<root>/<name>/SKILL.md` 或平铺的 `<root>/<name>.md`。
 把本目录整体放进任一扫描根即可（rank 小者优先，同名时浅层胜出）：
@@ -148,8 +169,7 @@ DSH 的 skill 发现深度**只有一层**，必须是 `<root>/<name>/SKILL.md` 
 > 目录名可以是 `literature-search`，但 frontmatter 里的 `name` 必须**全小写 kebab-case**，
 > 否则整个 skill 会被**静默丢弃**、不报错。
 >
-> 若你同时装了 `skill-create-debug-dsh`，可以用它的
-> `python scripts/audit.py --skill literature-search` 做一次静态体检。
+> 装完可先跑 `python bge_status.py`（不联网）确认 Python 环境与依赖是否齐备。
 
 ---
 
@@ -169,9 +189,11 @@ pip install requests openpyxl numpy sentence-transformers torch
 | `sentence-transformers` + `torch` | BGE 排序用 | 加载 `BAAI/bge-base-en-v1.5` |
 | `psutil` | 可选 | `bge_status.py` 查看内存占用 |
 
-**缺失时的行为**（都会明确降级，不会静默出错）：
+**缺失时的行为**：
 
-- 缺 `sentence-transformers` / `torch` → **跳过 BGE 排序**，退回按查询轮转融合的顺序，属降级而非失败；
+- 缺 `sentence-transformers` / `torch` → 排序环节会抛 `ImportError`。此时加 `--no-bge` 可跳过排序，
+  六环节照常产出（第 6 环节只是不按相关度重排）；
+- 缺 `numpy` → `relevance_scorer.py` 导入即失败，属**必需项**，不要省；
 - 缺 `ANTHROPIC_AUTH_TOKEN` → **跳过翻译**，保留英文标题/摘要；
 - 缺 `psutil` → 只有 `bge_status.py` 不可用，其余功能不受影响。
 
@@ -188,11 +210,12 @@ BGE 用的是 `BAAI/bge-base-en-v1.5`（768 维，约 **419 MB**）。如果可�
 
 ### 外部 CLI（可选）
 
-`journal_quartile.py` 通过 `searchts read <url>` 抓取 LetPub 的中科院新锐分区页面。
-**缺这个命令时分区查询不可用，其余功能全部正常**（脚本会返回 `找不到 searchts 命令` 并继续）。
+v2.2.0 的分区查询走 easyScholar 开放接口（HTTP），**不需要任何外部命令**，只需配置
+`EASYSCHOLAR_SECRET_KEY`。LetPub 仅作兜底通道，默认关闭，需要时显式加 `--allow-letpub`；
+它依赖 `searchts` 这个可选命令，缺了不影响其余功能。
 
-分区缓存（`.quartile_cache.json`）**不随仓库分发**：它是本机生成的大文件，且时效性强。
-首次批量查询每种期刊约 6–8 秒；200 篇若涉及 100 种期刊，首次约需 10–15 分钟，之后走缓存几乎瞬时。
+分区数据落在 `data/journal_zone.xlsx`，**不随仓库分发**（`.gitignore` 已排除）。`已收录` 60 天内免查，
+`未收录` 30 天，查询失败一律重试。接口限速约每秒一次，100 种刊首次约 2 分钟，之后命中本地表几乎瞬时。
 
 ---
 
@@ -209,7 +232,7 @@ BGE 用的是 `BAAI/bge-base-en-v1.5`（768 维，约 **419 MB**）。如果可�
 5. 传参方式：**`x-api-key` 请求头**（本 skill 只使用这一种方式，
    **不使用 URL 参数、任何情况下都不降级为匿名请求**）。
 
-> ⚠️ **为什么绝不使用匿名请求**：匿名请求走的是**全局共享池**（官方口径：1000 请求/秒由所有匿名用户共享），
+> ⚠️ **为什么绝不使用匿名请求**：匿名请求走的是**全局共享池**（官方说法：1000 请求/秒由所有匿名用户共享），
 > 稳定性完全不可控。带密钥遇到 429 是**你自己那张 key 触发了服务端限流封锁**，
 > 与"共享池被抢"无关，改用匿名请求既不能绕过，还会让排查更混乱。
 
@@ -243,7 +266,8 @@ setx SEMANTIC_SCHOLAR_API_KEY "s2k-你的密钥"
 | 变量 | 必需 | 说明 |
 |---|---|---|
 | `SEMANTIC_SCHOLAR_API_KEY` | **是** | 缺失时**直接报错退出，不会退化为匿名请求** |
-| `LITSEARCH_OUT_DIR` | 否 | 覆盖默认输出目录（默认 `./litsearch_output`） |
+| `LITSEARCH_OUT_DIR` | 否 | 覆盖默认输出目录（默认 `~/literature-search-out`） |
+| `EASYSCHOLAR_SECRET_KEY` | **建议必配** | 分区主通道。缺它且不加 `--allow-letpub` 时，分区查不到，第 5 环节会把所有记录按「无数据可判」排除 |
 | `ANTHROPIC_AUTH_TOKEN` | 否 | 翻译用；缺失则跳过翻译、保留英文 |
 | `ANTHROPIC_BASE_URL` | 否 | 翻译端点（默认 `https://api.deepseek.com/anthropic`） |
 | `LITSEARCH_MODEL` | 否 | 翻译模型（默认 `deepseek-flash`） |
@@ -257,26 +281,34 @@ setx SEMANTIC_SCHOLAR_API_KEY "s2k-你的密钥"
 **一步跑完整个流程：**
 
 ```bash
-python search_pipeline.py --out ./记录/20260920_示例主题 --per-round 200 --top-n 200 \
+python search_pipeline.py --out ./记录/20260920_示例主题 --per-round 300 --top 200 \
+  --topic "large language model reasoning with chain of thought prompting" \
   "large language model reasoning" \
   "chain of thought prompting" \
-  "math word problem solving"
+  "math word problem solving" \
+  "reasoning step decomposition benchmark"
 ```
 
 ```python
-# 或编程调用
+# 或编程调用（run 的签名：queries, topic, out_dir, ...）
+
+> **现行架构以 `SKILL.md` 的「六个环节」与 `AGENTS.md` §0 为准。** 本文中的历史章节
+> （分区只做新锐、主题闸门、Crossref 反查 ISSN 等）已被取代，冲突处以那两处为准。
+
 from search_pipeline import run
 
 res = run(
-    ["large language model reasoning",
-     "chain of thought prompting",
-     "math word problem solving"],
-    "./记录/20260920_示例主题",
-    per_round=200,      # 每轮取多少篇（= 2 页）
-    top_n=200,          # 入表篇数上限
-    gate_profile=None,  # 传 profile id 或 dict 才过闸门
+    queries=["large language model reasoning",
+             "chain of thought prompting",
+             "math word problem solving",
+             "reasoning step decomposition benchmark"],
+    topic="large language model reasoning with chain of thought prompting",
+    out_dir="./记录/20260920_示例主题",
+    per_round=300,      # 每轮取多少篇（= 3 页）
+    top_n=200,          # 可选：只保留前 200 篇，None 表示不截取
+    zone_filter=("1",),  # 分区条件，默认 JCR 1 区
 )
-print(res["api_calls"], res["rounds"])
+print(res["stage6"])   # 返回 stage1..stage6 各环节产物路径
 # 返回后【请让进程结束】—— BGE 占的内存只有进程退出才归还
 ```
 
@@ -300,7 +332,7 @@ python paper_table.py --xlsx 论文元数据.xlsx --enrich-zone --quiet
 python paper_table.py --xlsx 论文元数据.xlsx --selected
 ```
 
-**主题闸门调试：**
+**主题闸门调试（仅诊断旧模块，不参与流水线）：**
 
 ```bash
 python topic_gate.py --list-profiles
@@ -314,36 +346,41 @@ python topic_gate.py --explain "Chain-of-thought prompting elicits reasoning in 
 
 ```
 literature-search/
-├── SKILL.md                      # 114 行，主指令：精简流程 + 硬性规则
-├── AGENTS.md                     # 1284 行，驱动脚本模板、失败处理、排错手册、逐版本修复记录
+├── SKILL.md                      #  243 行，主指令：六环节摘要 + 硬性规则（触发用，不含细节）
+├── AGENTS.md                     # 1411 行，驱动脚本模板、失败处理、排错手册、逐版本记录
 ├── README.md / CHANGELOG.md / INSTALL.md / LICENSE / .gitignore
-├── semantic_scholar_search.py    # 1289 行，检索主流程（分页、去重、筛选、完整性报告）
-├── paper_table.py                #  829 行，元数据表落盘 / 按需读取
-├── relevance_scorer.py           #  495 行，BGE 多组评分（每组独立）
-├── translator.py                 #  452 行，批量翻译（可选，缺凭据自动跳过）
-├── journal_quartile.py           #  382 行，中科院新锐分区查询（LetPub，带缓存与 TTL）
-├── topic_gate.py                 #  349 行，主题闸门（内置一套示例 profile）
-├── search_pipeline.py            #  341 行，一步流程入口
-├── abstract_fill.py              #  330 行，摘要补全（五源逐级兜底）
-├── paper_details.py              #  289 行，Phase 2 详情
-├── crossref_fallback.py          #  263 行，备用源（未获同意直接拒绝执行）
-├── bge_status.py                 #  131 行，BGE 内存占用查看
-├── venue_rules.py                #   79 行，会议论文集按刊名识别（带正规期刊白名单）
-├── gate_profiles.json            # 你自己的主题闸门配置（含一套结构示例）
+├── search_pipeline.py            #  714 行，六环节编排入口（首选调用方式）
+├── semantic_scholar_search.py    # 1472 行，检索主流程（分页、去重、失败上报、完整性报告）
+├── paper_table.py                #  909 行，元数据表落盘 / 按需读取
+├── journal_quartile.py           #  715 行，分区查询（easyScholar 主通道，默认 JCR）
+├── relevance_scorer.py           #  571 行，BGE 评分（rank_topic 单句主题描述）
+├── translator.py                 #  459 行，批量翻译（可选，缺凭据自动跳过）
+├── topic_gate.py                 #  365 行，主题闸门（已不接入流水线，文件保留）
+├── paper_details.py              #  296 行，Phase 2 详情
+├── venue_rules.py                #  279 行，会议论文集按刊名识别（带正规期刊白名单）
+├── crossref_fallback.py          #  270 行，备用源（未获同意直接拒绝执行）
+├── abstract_fill.py              #  263 行，摘要补全（Elsevier + PubMed 两档）
+├── keyword_fetch.py              #  217 行，OpenAlex 批量取关键词与摘要
+├── bge_status.py                 #  138 行，BGE 内存占用查看
+├── gate_profiles.json            #  324 行，主题闸门配置（含一套结构示例）
 ├── references/
-│   └── examples-and-details.md   #  281 行，产出格式、使用示例、速率限制、BGE 原理
+│   ├── examples-and-details.md   #  281 行，产出格式、使用示例、速率限制、BGE 原理
+│   ├── 实测记录.md                #  190 行，实测数字集中存放
+│   ├── easyscholar-api.md        #  117 行，分区接口字段陷阱与调试清单
+│   └── journal-name-issues.md    #  103 行，刊名匹配不上时的规范化规则
 └── evals/
-    ├── test_abstract_fill.py                    # 120 行，摘要补全自测
-    ├── test_ratelimit.py                        # 113 行，失败重试策略自测
-    ├── test_report_failure_classification.py    # 109 行，故障分类自测
-    ├── test_report.py                           #  89 行，如实汇报留痕自测
-    ├── test_crossref_gate.py                    #  45 行，备用源门禁自测
-    ├── test_venue_rules.py                      #  43 行，会议识别自测
-    └── test-cases/                              # 8 个用例说明
+    ├── test_abstract_fill.py                   # 120 行，摘要补全自测
+    ├── test_ratelimit.py                       # 120 行，失败重试策略自测
+    ├── test_report_failure_classification.py   # 116 行，故障分类自测
+    ├── test_report.py                          #  96 行，如实汇报留痕自测
+    ├── test_crossref_gate.py                   #  52 行，备用源门禁自测
+    ├── test_venue_rules.py                     #  43 行，会议识别自测
+    └── test-cases/                             # 8 个用例说明
 ```
 
-合计 35 个文件、394 KB，其中 Python 5748 行、Markdown 2784 行。
+合计 39 个文件、479 KB，其中 Python 7215 行、Markdown 3604 行。
 `AGENTS.md` 与 `references/` 是长文档，`SKILL.md` 只在需要精确细节时指向它们，这样触发成本才可控。
+`data/journal_zone.xlsx`（分区表）与 `.letpub_zone_cache.json`（旧缓存）属于本地资产，已被 `.gitignore` 排除。
 
 ---
 
@@ -353,7 +390,7 @@ literature-search/
 
 | 规则 | 说明 |
 |---|---|
-| **失败即上报** | 首次请求失败后各等 **10s** 重试，共 **3 次请求**（累计约 20 秒）；仍失败即抛 `ApiUnavailableError`，**暂停检索并立即向用户提问** |
+| **失败即上报** | 请求失败按指数退避重试（10s → 20s → 40s，累计约 70 秒，共 3 次请求）；仍失败即抛 `ApiUnavailableError`，**暂停检索并立即向用户提问** |
 | **二选一，不自行决定** | **1)** 持续等待 3–5 分钟后重试（首选）；**2)** 降级使用 Crossref 备用源（最后手段） |
 | **不得把失败当成「0 篇结果」** | 只有 `200` + 空 `data` 才算"确实未命中"；`5xx` / 网络错误一律记 `failed` |
 | **失败时必须保全部分结果** | 用 `searcher.collected_partial()` 取回中断前已取回的部分并落盘 |
@@ -390,12 +427,16 @@ literature-search/
 
 ### 四、分区数据的固有缺陷
 
-分区来自 LetPub 的中科院《新锐期刊分区表》，**收录不全**。`filter_papers()` 会**放行**未收录的论文；
-若要"只要 1/2 区"，必须自行改为严格过滤，并主动说明：
-被丢弃的 `未收录` 里可能包含本属 1/2 区的期刊。
+分区来自 easyScholar（默认 JCR 四分位，可切中科院新锐），**收录不全**。第 5 环节把「无刊名」
+与「未收录」一律按「无数据可判」排除，汇报时必须单独说明这批数量，因为被排除的记录里
+可能包含本属 1 区的期刊。
 
-⚠️ **v2.0 之前的分区缓存不可信**：旧实现靠网页 `<title>` 正则解析，实测把一本 1 区期刊记成了 2 区。
-缓存版本号已升到 v2，**v1 旧缓存一律视为失效**；必要时用 `--enrich-zone --refresh` 重查。
+实测（2026-11-03 一次检索）：521 条进入第 5 环节，其中 250 条因「该刊未被分区库收录」、
+25 条因「无刊名」被排除，最终留下 91 条 1 区论文。
+
+⚠️ **分区表带查询日期**：`已收录` 60 天、`未收录` 30 天后重查，查询失败一律重试。
+早期实现靠网页 `<title>` 正则解析，实测把一本 1 区期刊记成 2 区，那类旧缓存已作废；
+怀疑数据不准时用 `--enrich-zone --refresh` 全量重查。
 
 ### 五、如实汇报（最高优先级）
 
@@ -404,7 +445,7 @@ literature-search/
 
 - **完全没检索到** → 区分「确实未命中」与「检索失败」，后者**不能**得出"该领域没有文献"的结论；
 - **只检索到部分** → 说明哪些查询失败、哪些达到抓取上限；
-- **中途换过数据源** → 说明何时、为何换源，以及口径差异（Crossref 只能检索到有 DOI 的文献，摘要覆盖率约 28%）；
+- **中途换过数据源** → 说明何时、为何换源，以及判定标准不同（Crossref 只能检索到有 DOI 的文献，摘要覆盖率约 28%）；
 - **分区数据缺失** → 说明多少条因未收录被排除；
 - **翻译失败/被跳过** → 说明是保留了英文原文；
 - **人工去噪** → 说明剔除标准与数量。
@@ -414,8 +455,8 @@ literature-search/
 
 ### 六、其他
 
-- **输出目录默认是 `./litsearch_output`**，用 `LITSEARCH_OUT_DIR` 或 `save_dir=` 覆盖；
-- **`.quartile_cache.json` 不在仓库里**，首次跑分区查询会慢（每种期刊 6–8 秒）；
+- **输出目录默认是 `~/literature-search-out`**，用 `LITSEARCH_OUT_DIR` 或 `save_dir=` 覆盖；
+- **`data/journal_zone.xlsx` 不在仓库里**，首次跑分区查询会慢（接口限速约每秒一次）；
 - **结构化筛选前会校验字段**：列不存在、或**列存在但整列为空**都会**直接报错退出**，
   后者是最危险的静默失败（实测"只要 1 区"曾把 565 篇静默全部排除，看起来像"该领域没有 1 区论文"）；
 - **`PaperID` / `DOI` 列强制文本格式**，否则 Excel 会把长 ID 显示成科学计数法，Phase 2 会整批查不到；
@@ -427,13 +468,14 @@ literature-search/
 
 1. **主数据源单一**：主力是 Semantic Scholar。备用源 Crossref **只能检索到有 DOI 的文献**，
    无 DOI 的会议论文、区域性期刊、技术报告、标准等一律检索不到，存在**系统性覆盖缺口**。
-2. **分区数据不完整**：LetPub 未收录的期刊标记为 `未收录`。
+2. **分区数据不完整**：easyScholar 未收录的期刊标记为 unknown 并在第 5 环节排除。
 3. **首次 BGE 加载约 100 秒**（CPU），且内存只有进程退出才归还。
 4. **`evals/test-cases/` 下的部分用例描述早于当前架构**
    （例如仍写"默认 limit=50"、"用 Semantic Scholar batch API 取摘要"），与现行流程不一致，仅作历史参考。
 5. **翻译默认指向一个 Anthropic 兼容端点**（`https://api.deepseek.com/anthropic` + `deepseek-flash`），
    换供应商需要自行设置 `ANTHROPIC_BASE_URL` 与 `LITSEARCH_MODEL`。
-6. **`journal_quartile.py` 依赖外部 CLI `searchts`**，缺它则分区查询不可用（其余功能正常）。
+6. **`journal_quartile.py` 的兜底通道依赖外部 CLI `searchts`**。默认走 easyScholar 接口，
+   不需要它；只有显式加 `--allow-letpub` 时才会用到，缺了则只有那一档不可用。
 
 ---
 
@@ -443,9 +485,9 @@ literature-search/
 |---|---|
 | Python | 3.10+（开发与实测环境为 3.13） |
 | 第三方包（必备） | `requests`、`openpyxl`（元数据表读写） |
-| 第三方包（BGE 排序） | `numpy`、`sentence-transformers`、`torch`；缺失时**跳过排序**并降级，不算失败 |
+| 第三方包（BGE 排序） | `numpy`、`sentence-transformers`、`torch`；缺 torch 时须加 `--no-bge` 跳过排序，缺 numpy 属必需项 |
 | 第三方包（可选） | `psutil`，仅 `bge_status.py` 用 |
-| 外部 CLI（可选） | `searchts`，仅 `journal_quartile.py` 分区查询用；缺失时**只有分区查询不可用**，其余功能正常 |
+| 外部 CLI（可选） | `searchts`，仅在 `--allow-letpub` 兜底通道下使用；默认通道走 easyScholar 接口，不需要它 |
 | 数据源 | Semantic Scholar（**需自备 API Key**）；Crossref（备用，**必须先获用户同意**） |
 | 模型缓存 | `BAAI/bge-base-en-v1.5` 约 419 MB；首次加载约 100 秒（CPU） |
 | 平台 | 在 Windows 上开发；代码有跨平台分支，但**非 Windows 平台的实测覆盖较少**，在 Linux / macOS 上遇到问题请提 issue |

@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""中科院《新锐期刊分区表》查询（LetPub） v3.0
+"""期刊分区查询（easyScholar 主通道，LetPub 兜底） v4.0
 
-为什么只做中科院分区、不做 JCR
-------------------------------
-JCR（Clarivate，基于 JIF 的四分位）**没有可用的免费数据源**：需要 Web of Science /
-JCR 订阅，Clarivate API 需付费，LetPub 检索页也只给 IF、CiteScore、中科院区，不显示
-JCR 四分位。第三方站点（journalmetrics.org 等）给出的是它们**自算**的四分位
-（OpenAlex 口径），既不是 JCR 也不是 Scopus 官方 CiteScore 四分位——拿它当 JCR 汇报
-会出错。因此本模块只提供中科院新锐分区（1–4 区），不提供任何代理指标。
+分区标准的两套口径
+------------------
+- **JCR 四分位**（Clarivate，基于 JIF）：easyScholar 开放接口直接返回，`--zone-basis jcr` 使用，
+  v2.2.0 起为**默认标准**。
+- **中科院分区**（新锐 / 升级版 / 基础版）：同一接口一并返回，`--zone-basis xr` 使用。
+
+为什么不靠第三方站点的自算四分位
+--------------------------------
+journalmetrics.org 之类给出的是它们**自算**的四分位（OpenAlex 标准），既不是 JCR
+也不是 Scopus 官方 CiteScore 四分位，拿它当 JCR 汇报会出错。本模块因此只采信
+easyScholar 返回的官方口径，不提供任何代理指标。
+
+数据落地
+--------
+每次查询结果写入 `data/journal_zone.xlsx`，一行一本刊，带 `查询日期`。
+`已收录` 60 天内免查，`未收录` 30 天，`查询失败` 一律重试。
 
 v3.0 的三处变更（2026-10-30 实测驱动）
 --------------------------------------
-1. **删除 journalmetrics 分支**（原 Q1–Q4 那套，约 100 行）：口径不可靠，且与中科院
+1. **删除 journalmetrics 分支**（原 Q1–Q4 那套，约 100 行）：标准不可靠，且与中科院
    分区不是一回事。连带删除 `.quartile_cache.json`。
 2. **抓取优先 `--backend curl_cffi`**：实测 LetPub 页面用默认三级升级链要 **7.0~9.3 s**，
    强制 curl_cffi 只要 **2.6~3.6 s**（6/6 成功，返回数据还更全 15 KB vs 13 KB）。
@@ -44,8 +53,16 @@ v3.0 的三处变更（2026-10-30 实测驱动）
 import os
 import re
 import sys
+# 控制台编码兜底：Windows 默认 GBK，打印中文/特殊字符会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import json
 import time
+import requests
 import subprocess
 from urllib.parse import quote as _quote
 
@@ -92,6 +109,300 @@ def save_letpub_cache(c):
             json.dump(c, f, indent=2, ensure_ascii=False, sort_keys=True)
     except Exception as e:
         print(f"[WARN] 新锐分区缓存写入失败: {e}", file=sys.stderr)
+
+
+# ------------------------------------------------ Excel 分区表（v2.1.0 起为权威源）
+# 分区数据固定存进 skill 目录的 data/journal_zone.xlsx，用户可直接打开看、手改、留档。
+# 每行带查询日期（YYYY-MM-DD），用来判断是否重查。旧 JSON 缓存只作一次性迁移来源。
+
+ZONE_XLSX = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "data", "journal_zone.xlsx")
+ZONE_HEADER = ["期刊名", "ISSN", "新锐分区", "中科院升级版", "中科院基础版", "JCR分区",
+               "影响因子", "五年影响因子", "中科院预警", "状态", "查询日期", "来源"]
+ZONE_TTL_DAYS = 60           # 已收录：超过 60 天视为过期，本次用到时会重查一次并更新日期
+ST_ZONE, ST_NONE, ST_FAIL = "已收录", "未收录", "查询失败"
+# 规范化后仍查不到时，按原因分三态标注，不再一律记「查询失败」
+NA_CONF, NA_PREPRINT, NA_OTHER = "无法查询(会议论文)", "无法查询(预印本)", "无法查询(其他原因)"
+
+_CONF_PREFIX = re.compile(
+    r"^\s*(proceedings\s+of|spie\b|annual\s+review\s+of\s+progress|"
+    r"international\s+workshop|conference\s+on|symposium\s+on)", re.I)
+_VOLUME_TAIL = re.compile(r"[,\s]*\bvolume\s+\d+\b.*$", re.I)
+_PAREN_TAIL = re.compile(r"\s*\((print|online|electronic)\)\s*$", re.I)
+
+
+def _na_reason(name):
+    """只在两次查询都失败后调用，判断「无法查询」属于哪一类。
+
+    它**不决定是否查询**，只决定失败后挂哪个标签，所以误判的代价只是标签不准，
+    不会让本该有分区的论文被跳过。
+    """
+    s = str(name or "").strip()
+    if not s:
+        return NA_OTHER
+    if re.fullmatch(r"volume\s+\d+", s, re.I):
+        return NA_CONF
+    try:
+        import venue_rules
+        if venue_rules.is_conference_venue(s):
+            return NA_CONF
+    except Exception:
+        pass
+    # 白名单必须排在兜底正则之前：Proceedings of the Institution of ... 是正规期刊，
+    # 若先跑关键字兜底，它会被 "Proceedings" 命中而误标成会议论文。
+    if re.search(r"Proceedings\s+of\s+the\s+Institution\s+of\s+"
+                 r"(Mechanical|Civil)\s+Engineers", s, re.I):
+        return NA_OTHER
+    if re.search(r"\b(conference|proceedings|symposium|workshop|congress)\b", s, re.I):
+        return NA_CONF
+    if re.search(r"\b(preprint|arxiv|biorxiv|medrxiv|ssrn|research\s*square)\b", s, re.I):
+        return NA_PREPRINT
+    return NA_OTHER
+
+
+def _normalize_venue(name):
+    """刊名规范化。返回 (清洗后的刊名, 直接判定的不可查原因 或 "")。
+
+    规则见 references/journal-name-issues.md 第五节。宁可返回空、记 NULL，
+    也不做模糊匹配，避免写入错误分区。
+    """
+    if not name:
+        return "", NA_OTHER
+    s = str(name).strip()
+    # 会议录判定**必须**复用 venue_rules，不能自己写正则：
+    # 那边有 KEEP_VENUE_PATTERN 白名单，能保住
+    # 「Proceedings of the Institution of Mechanical Engineers」这类正规期刊。
+    try:
+        import venue_rules
+        if venue_rules.is_conference_venue(s):
+            return "", NA_CONF
+    except Exception:
+        pass
+    s = _VOLUME_TAIL.sub("", s).strip()
+    if not s or re.fullmatch(r"volume\s+\d+", s, re.I):
+        return "", NA_CONF
+    s = _PAREN_TAIL.sub("", s).strip()
+    # 全大写且无空格：按驼峰/大小写边界拆词
+    if s.isupper() and " " not in s and len(s) > 12:
+        s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s.title())
+    return s, ""
+
+# ---- easyScholar（主通道）------------------------------------------------
+# 按刊名查，一次返回中科院分区、JCR 分区、影响因子、五年影响因子、中科院预警。
+# 密钥在 easyscholar.cc 注册后到用户中心取，存 ~/.dsh/env.json 的 EASYSCHOLAR_SECRET_KEY。
+EASY_BASE = "https://www.easyscholar.cc/open/getPublicationRank"
+EASY_ENV = "EASYSCHOLAR_SECRET_KEY"
+EASY_TIMEOUT = 30
+EASY_INTERVAL = 1.0          # 相邻请求最小间隔（秒）。文档要求 ≤2 次/秒，这里按 1 秒 1 次
+_last_easy = 0.0
+
+# ---- LetPub（备用通道）---------------------------------------------------
+# 只有中科院分区，没有 JCR 与影响因子。按用户要求：**必须经用户同意才启用**。
+ALLOW_LETPUB = False          # 由 --allow-letpub / 调用方显式置 True
+
+
+def easy_key():
+    k = os.getenv(EASY_ENV) or ""
+    if k:
+        return k
+    try:
+        j = json.load(open(os.path.join(os.path.expanduser("~"), ".dsh", "env.json"),
+                           encoding="utf-8"))
+        return (j.get("env") or {}).get(EASY_ENV) or ""
+    except Exception:
+        return ""
+
+
+def easyscholar_rank(name, key=None, timeout=EASY_TIMEOUT):
+    """按刊名向 easyScholar 查全套分区指标。
+
+    Returns:
+        dict | None：{"cas","cas_top","jcr","if","if5","warn","hit"}
+        查不到（code!=200 或全空）返回 None；网络/密钥问题抛 RuntimeError。
+    """
+    key = key or easy_key()
+    if not key:
+        raise RuntimeError("未配置 EASYSCHOLAR_SECRET_KEY")
+    if not name:
+        return None
+    global _last_easy                      # easyScholar 独立节流：1 秒 1 次
+    gap = EASY_INTERVAL - (time.time() - _last_easy)
+    if gap > 0:
+        time.sleep(gap)
+    _last_easy = time.time()
+    try:
+        r = requests.get(EASY_BASE, params={"secretKey": key, "publicationName": name},
+                         timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"easyScholar 请求异常：{type(e).__name__}")
+    if r.status_code != 200:
+        raise RuntimeError(f"easyScholar HTTP {r.status_code}")
+    try:
+        d = r.json()
+    except Exception:
+        raise RuntimeError("easyScholar 返回非 JSON")
+    if d.get("code") != 200 or not d.get("data"):
+        return None
+    # 读 all 而不是 select：select 依赖用户浏览器扩展里勾选了哪些数据集，会随人变化
+    off = ((d["data"].get("officialRank") or {}).get("all") or {})
+    sel = ((d["data"].get("officialRank") or {}).get("select") or {})
+
+    def pick(*vals):
+        for v in vals:
+            if v not in (None, "", "null"):
+                return str(v).strip()
+        return ""
+
+    def _cas(v):
+        m = re.search(r"([1-4])\s*区", str(v or ""))
+        return m.group(1) if m else pick(v)
+
+    def _quart(v):
+        """JCR 四分位归一化为单个数字。
+
+        easyScholar 的 `sci` 字段可能返回 "Q1"、"1区" 或 "1" 三种写法，
+        筛选侧只认 "1"~"4"，所以统一取第一个 1~4 的数字。
+        """
+        m = re.search(r"([1-4])", str(v or ""))
+        return m.group(1) if m else ""
+
+    out = {
+        "cas": _cas(off.get("xr")),            # 新锐分区
+        "cas_base": _cas(off.get("sciUp")),    # 中科院升级版
+        "cas_base2": _cas(off.get("sciBase")),  # 中科院基础版
+        "jcr": _quart(off.get("sci")),
+        "if": pick(off.get("sciif"), sel.get("sciif")),
+        "if5": pick(off.get("sciif5"), sel.get("sciif5")),
+        "warn": pick(off.get("sciWarn")),      # 注意是 sciWarn，不是 sciWarning
+        "source": "easyScholar",
+    }
+    if not any(out[k] for k in ("cas", "cas_base", "jcr", "if", "if5", "warn")):
+        return None
+    return out
+
+
+_zone_rows = None            # 进程内：{key: {"name","issn","zone","status","date"}}
+_DEFER_SAVE = False          # 批量查询时置 True，最后统一写一次
+
+
+def _zone_key(issn, name):
+    return ("issn:" + str(issn).upper()) if issn else ("name:" + _norm_journal(name))
+
+
+ZONE_COLS = ["name", "issn", "cas_up", "cas_base", "cas_base2", "jcr", "if_", "if5",
+             "warn", "status", "date", "source"]
+
+def load_zone_xlsx(force=False):
+    """读分区表；首次调用会把旧 JSON 缓存并进来（一次性迁移）。"""
+    global _zone_rows
+    if _zone_rows is not None and not force:
+        return _zone_rows
+    rows = {}
+    try:
+        for k, e in (load_letpub_cache() or {}).items():
+            if not isinstance(e, dict):
+                continue
+            ts = float(e.get("ts") or 0)
+            rows[k] = {"name": e.get("hit") or "",
+                       "issn": k[5:] if k.startswith("issn:") else "",
+                       "cas_up": e.get("zone") or "", "cas_base": "",
+                       "jcr": "", "if_": "", "if5": "", "warn": "",
+                       "status": ST_ZONE if e.get("zone") else ST_NONE,
+                       "date": time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "",
+                       "source": "LetPub"}
+    except Exception:
+        pass
+    if os.path.exists(ZONE_XLSX):
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(ZONE_XLSX, read_only=True, data_only=True)
+            ws = wb.worksheets[0]
+            it = ws.iter_rows(values_only=True)
+            hdr = [str(x or "").strip() for x in (next(it, None) or [])]
+            legacy = (len(hdr) == 5)          # 旧的 5 列版：期刊名/ISSN/分区/状态/查询日期
+            for r in it:
+                if not r:
+                    continue
+                vals = [str(x or "").strip() for x in r]
+                if legacy:
+                    vals += [""] * (5 - len(vals))
+                    d = {"name": vals[0], "issn": vals[1], "cas_up": vals[2],
+                         "cas_base": "", "jcr": "", "if_": "", "if5": "", "warn": "",
+                         "status": vals[3], "date": vals[4], "source": "LetPub"}
+                else:
+                    vals += [""] * (len(ZONE_COLS) - len(vals))
+                    d = dict(zip(ZONE_COLS, vals))
+                if not (d["name"] or d["issn"]):
+                    continue
+                rows[_zone_key(d["issn"], d["name"])] = d
+            wb.close()
+        except Exception as e:
+            print(f"[WARN] 读分区表失败，按空表处理: {e}", file=sys.stderr)
+    _zone_rows = rows
+    return rows
+
+
+def save_zone_xlsx(rows=None):
+    """整表重写：先写 .tmp 再替换，避免中途打断留下坏文件。"""
+    rows = rows if rows is not None else (_zone_rows or {})
+    try:
+        from openpyxl import Workbook
+        os.makedirs(os.path.dirname(ZONE_XLSX), exist_ok=True)
+        wb = Workbook(); ws = wb.active; ws.title = "期刊分区"
+        ws.append(ZONE_HEADER)
+        for k in sorted(rows):
+            r = rows[k]
+            ws.append([r.get(c, "") for c in ZONE_COLS])
+        ws.freeze_panes = "A2"
+        tmp = ZONE_XLSX + ".tmp"
+        wb.save(tmp)
+        os.replace(tmp, ZONE_XLSX)
+        return True
+    except Exception as e:
+        print(f"[WARN] 分区表写入失败: {e}", file=sys.stderr)
+        return False
+
+
+def zone_stats():
+    rows = load_zone_xlsx()
+    n = {"已收录": 0, "未收录": 0, "查询失败": 0}
+    src = {}
+    for e in rows.values():
+        n[e.get("status", "")] = n.get(e.get("status", ""), 0) + 1
+        s = e.get("source") or "(空)"
+        src[s] = src.get(s, 0) + 1
+    return {"总数": len(rows), **n, "按来源": src, "文件": ZONE_XLSX}
+
+
+def _zone_entry(key, older_than=None):
+    """取可用条目；不存在或已过期返回 None。查询失败一律重试。"""
+    e = (load_zone_xlsx().get(key))
+    if not e:
+        return None
+    st = e.get("status") or ""
+    if st == ST_FAIL:
+        return None
+    d = e.get("date") or ""
+    if not d:
+        return None
+    try:
+        age = (time.time() - time.mktime(time.strptime(d, "%Y-%m-%d"))) / 86400.0
+    except Exception:
+        return None
+    limit = older_than if older_than is not None else (
+        ZONE_TTL_DAYS if st == ST_ZONE else NEGATIVE_TTL_DAYS)
+    return e if age <= limit else None
+
+
+def _zone_upsert(key, name, issn, zone, status, cas_base="", jcr="", if_="", if5="",
+                 warn="", source="LetPub", cas_base2=""):
+    rows = load_zone_xlsx()
+    rows[key] = {"name": name or "", "issn": issn or "", "cas_up": zone or "",
+                 "cas_base": cas_base or "", "cas_base2": cas_base2 or "",
+                 "jcr": jcr or "", "if_": if_ or "",
+                 "if5": if5 or "", "warn": warn or "", "status": status,
+                 "date": time.strftime("%Y-%m-%d"), "source": source}
+    return rows
 
 
 def _wait():
@@ -191,30 +502,97 @@ def _parse_letpub(md, want_issn=None, want_name=None):
 
 # ---------------------------------------------------------------- 查询
 
-def letpub_zone(issn=None, name=None, use_cache=True, refresh=False, timeout=60):
-    """查中科院《新锐期刊分区表》。
+def _basis_value(d, basis):
+    """按标准从归档行或 easyScholar 结果里取分区值。
+
+    归档行用 `cas_up` 存新锐、`jcr` 存 JCR；easyScholar 结果里新锐叫 `cas`。
+    两个键名都认，避免调用方记两套名字。
+    """
+    b = (basis or "jcr").strip().lower()
+    if b == "xr":
+        return str(d.get("cas_up") or d.get("cas") or "")
+    return str(d.get("jcr") or "")
+
+
+def letpub_zone(issn=None, name=None, use_cache=True, refresh=False, timeout=60,
+                older_than=None, basis="jcr"):
+    """查期刊分区（标准由 basis 决定）。
 
     Args:
-        issn: 期刊 ISSN（优先，精确匹配）
-        name: 期刊名（ISSN 缺失时才用，缩写会漏）
+        issn: 期刊 ISSN。easyScholar 是刊名接口，ISSN 只作归档键的加成
+        name: 期刊名（主查询键）
         use_cache: False = 完全绕过缓存
         refresh: True = 忽略已有缓存重查（未收录项也会重查）
+        basis: "jcr"（默认）或 "xr"（中科院新锐）
     Returns:
         (zone|None, 命中刊名|None, 来源说明)
     """
     if not issn and not name:
         return None, None, "既没给 ISSN 也没给刊名"
 
-    key = ("issn:" + str(issn).upper()) if issn else ("name:" + _norm_journal(name))
-    cache = load_letpub_cache()
+    # 注意：这里**不做任何查前预判**。会议录、Volume 之类也先用原名真查一次，
+    # 因为「看起来像会议录」不等于「一定查不到」，早年 Proceedings of the
+    # Institution of Mechanical Engineers 这种正规期刊就会被误杀。
+    # 原因标注只在两次查询都失败之后做，见下面的 _na_reason()。
+
+    key = _zone_key(issn, name)
 
     if use_cache and not refresh:
-        e = cache.get(key)
-        if isinstance(e, dict) and e.get("v") == LETPUB_CACHE_VERSION:
-            # 有值 → 直接用；未收录 → 超过 TTL 才重查
-            if e.get("zone") or (time.time() - float(e.get("ts") or 0)
-                                 < NEGATIVE_TTL_DAYS * 86400):
-                return e.get("zone"), e.get("hit"), "缓存"
+        e = _zone_entry(key, older_than=older_than)
+        if e:
+            return ((_basis_value(e, basis) or None), (e.get("name") or None),
+                    "分区表缓存(" + (e.get("source") or "") + ")")
+
+    # ---- 主通道：easyScholar（中科院分区两版 + JCR + IF + 预警）----
+    if easy_key():
+        try:
+            rk = easyscholar_rank(name)
+        except RuntimeError as ex:
+            rk = None
+            print(f"[WARN] easyScholar 不可用：{ex}", file=sys.stderr)
+        if rk:
+            val = _basis_value(rk, basis)
+            rows = _zone_upsert(key, name, issn, rk["cas"],
+                                ST_ZONE if rk["cas"] else ST_NONE,
+                                cas_base=rk["cas_base"], jcr=rk["jcr"], if_=rk["if"],
+                                if5=rk["if5"], warn=rk["warn"], source="easyScholar",
+                                cas_base2=rk.get("cas_base2", ""))
+            if not _DEFER_SAVE:
+                save_zone_xlsx(rows)
+            return (val or None), name, "easyScholar"
+
+        # 第一次用原名没查到 → 规范化后再试一次（只多花一次请求）
+        nm2, _ = _normalize_venue(name)
+        if nm2 and nm2.strip().lower() != (name or "").strip().lower():
+            try:
+                rk = easyscholar_rank(nm2)
+            except RuntimeError as ex:
+                rk = None
+                print(f"[WARN] easyScholar 规范化重试失败：{ex}", file=sys.stderr)
+            if rk:
+                val = _basis_value(rk, basis)
+                rows = _zone_upsert(key, name, issn, rk["cas"],
+                                    ST_ZONE if rk["cas"] else ST_NONE,
+                                    cas_base=rk["cas_base"], jcr=rk["jcr"], if_=rk["if"],
+                                    if5=rk["if5"], warn=rk["warn"], source="easyScholar",
+                                    cas_base2=rk.get("cas_base2", ""))
+                if not _DEFER_SAVE:
+                    save_zone_xlsx(rows)
+                return (val or None), name, "easyScholar(规范化后命中)"
+
+        # 两次都查不到 → 这时才判原因。查前不判，避免误杀。
+        why = _na_reason(name)
+        rows = _zone_upsert(key, name, issn, "", why, source="easyScholar")
+        if not _DEFER_SAVE:
+            save_zone_xlsx(rows)
+        return None, None, why
+
+    # ---- 备用通道：LetPub（只有中科院分区），须用户明确同意 ----
+    if not ALLOW_LETPUB:
+        rows = _zone_upsert(key, name, issn, "", ST_FAIL, source="需授权(LetPub)")
+        if not _DEFER_SAVE:
+            save_zone_xlsx(rows)
+        return None, None, "LetPub 未授权，已跳过"
 
     param, value = ("searchissn", issn) if issn else ("searchname", name)
     url = f"{LETPUB_SEARCH}&{param}={_quote(str(value))}&searchsort=relevance"
@@ -235,111 +613,65 @@ def letpub_zone(issn=None, name=None, use_cache=True, refresh=False, timeout=60)
             time.sleep(1.0)
 
     src = "ISSN 精确匹配" if (issn and zone) else ("刊名模糊匹配" if zone else "未查到")
-    cache[key] = {"v": LETPUB_CACHE_VERSION, "zone": zone, "hit": hn,
-                  "src": src, "backend": backend, "ts": int(time.time())}
-    save_letpub_cache(cache)
+    rows = _zone_upsert(key, hn or name, issn, zone,
+                        ST_ZONE if zone else (ST_NONE if backend else ST_FAIL))
+    if not _DEFER_SAVE:
+        save_zone_xlsx(rows)
     return zone, hn, src
 
 
-def letpub_zone_many(items, verbose=True, refresh=False):
-    """批量：items 为 [(issn, name), ...]。有 ISSN 就走 ISSN，否则退回刊名。
+def letpub_zone_many(items, verbose=True, refresh=False, basis="jcr"):
+    """批量：items 为 [(issn, name), ...]。
 
-    ⚠️ **必须串行**：并发 >4 会被 LetPub 限流，表现为整批返回空结果。
-    实测单本 2.6~3.6 s（curl_cffi 档），缓存命中瞬时。
+    ⚠️ **必须串行**：easyScholar 限 2 次/秒，这里按 1 秒 1 次，绝不可并发。
     """
     out = {}
     total = len(items)
-    for i, (issn, name) in enumerate(items, 1):
-        zone, hn, src = letpub_zone(issn=issn, name=name, refresh=refresh)
-        out[(issn, name)] = zone
-        if verbose:
-            tag = f"{issn or '-'} / {name or '-'}"
-            print(f"  [{i}/{total}] {tag[:60]:<60} {zone or 'unknown'}  ({src})",
-                  file=sys.stderr)
-        _wait()
+    global _DEFER_SAVE
+    _DEFER_SAVE = True
+    try:
+        for i, (issn, name) in enumerate(items, 1):
+            zone, hn, src = letpub_zone(issn=issn, name=name,
+                                        refresh=refresh, basis=basis)
+            out[(issn, name)] = zone
+            if verbose:
+                tag = f"{issn or '-'} / {name or '-'}"
+                print(f"  [{i}/{total}] {tag[:60]:<60} {zone or 'unknown'}  ({src})",
+                      file=sys.stderr)
+            _wait()
+    finally:
+        _DEFER_SAVE = False
+        save_zone_xlsx()      # 整批只写一次盘
     return out
 
 
-# ---------------------------------------------------------------- ISSN 解析
+# ---------------------------------------------------------------- 批量入口
 #
-# LetPub 的精确匹配键是 **ISSN**，但元数据表里没有 ISSN 列（Semantic Scholar 不返回）。
-# 所以先按刊名去重、每刊取一个 DOI，用 Crossref 反查 ISSN，结果缓存复用。
-#
-# ⚠️ 这段逻辑**只在这里维护一份**：`paper_table.enrich_zone_column()` 与
-# `semantic_scholar_search.enrich_quartiles()` 都走 `zone_map_for_journals()`，
-# 避免出现"一条路径按 ISSN、另一条按刊名"的不一致（v3.0 之前就是这样）。
-ISSN_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               ".issn_cache.json")
-CROSSREF_MAILTO = "dsh-litsearch@example.com"
+# easyScholar 是**按刊名**查询的接口，ISSN 不是查询主键，只作归档键的加成。
+# 早期版本为了给 LetPub 做精确匹配，先用 Crossref 按 DOI 反查 ISSN 并缓存到
+# `.issn_cache.json`；现已删除该路径——分区信息只允许来自 S2 的
+# `publicationVenue.issn`（可能为空）或干脆不用 ISSN。
 
 
-def _crossref_issn(doi, timeout=25):
-    """DOI → ISSN（Crossref）。失败返回 None。"""
-    if not doi:
-        return None
-    try:
-        import requests
-        r = requests.get(f"https://api.crossref.org/works/{doi}",
-                         params={"mailto": CROSSREF_MAILTO}, timeout=timeout,
-                         headers={"User-Agent": f"DSH-litsearch/1.0 (mailto:{CROSSREF_MAILTO})"})
-        if r.status_code != 200:
-            return None
-        issns = r.json().get("message", {}).get("ISSN") or []
-        return issns[0] if issns else None
-    except Exception:
-        return None
-
-
-def resolve_issns(name_to_doi, verbose=True):
-    """刊名 → ISSN。优先读缓存，缺的用 Crossref 按 DOI 反查。
-
-    Args:
-        name_to_doi: {"期刊名": "DOI 或空串"}
-    Returns:
-        {"期刊名": "ISSN" 或 None}
-
-    实测：82 篇 → 81 本刊 → 81 次请求（首次约 1 分钟），之后走缓存瞬时。
-    """
-    cache = {}
-    if os.path.exists(ISSN_CACHE_FILE):
-        try:
-            with open(ISSN_CACHE_FILE, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except Exception:
-            cache = {}
-
-    todo = [(n, d) for n, d in name_to_doi.items() if not cache.get(n) and d]
-    if todo and verbose:
-        print(f"[ISSN] 缓存未命中 {len(todo)} 本，用 Crossref 按 DOI 反查…", flush=True)
-    for i, (name, doi) in enumerate(todo, 1):
-        issn = _crossref_issn(doi)
-        cache[name] = issn or ""
-        if verbose:
-            print(f"  [{i}/{len(todo)}] {name[:50]:<50} {issn or 'unknown'}", flush=True)
-        time.sleep(0.2)
-
-    try:
-        with open(ISSN_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        pass
-    return {n: (cache.get(n) or None) for n in name_to_doi}
-
-
-def zone_map_for_journals(name_to_doi, refresh=False, verbose=True):
-    """刊名 → 中科院分区（"1"~"4" 或 None）。ISSN 优先，刊名兜底。
+def zone_map_for_journals(name_to_doi, refresh=False, verbose=True,
+                          issns=None, basis="jcr"):
+    """刊名 → 分区（"1"~"4" 或 None）。
 
     这是**唯一**的分区批量入口，`paper_table` 与 `semantic_scholar_search` 都调它。
+
+    Args:
+        name_to_doi: {"期刊名": "DOI 或空串"}（DOI 目前不参与查询，保留兼容）
+        issns: 可选的 {"期刊名": "ISSN"}，来自 S2 的 publicationVenue.issn。
+               没有就用纯刊名查，**不做任何外部反查**。
+        basis: "jcr"（默认）或 "xr"
     """
-    issn_map = resolve_issns(name_to_doi, verbose=verbose)
-    items = [(issn_map.get(n), None if issn_map.get(n) else n) for n in name_to_doi]
+    issns = issns or {}
+    items = [(issns.get(n) or None, n) for n in name_to_doi]
     if verbose:
-        got = sum(1 for v in issn_map.values() if v)
-        print(f"[ZONE] ISSN 已解析 {got}/{len(name_to_doi)} 本；"
-              f"开始查中科院分区（单本约 2.6~3.6 秒，串行，勿并发）…", flush=True)
-    zones = letpub_zone_many(items, verbose=verbose, refresh=refresh)
-    return {n: zones.get((issn_map.get(n), None if issn_map.get(n) else n))
-            for n in name_to_doi}
+        print(f"[ZONE] 开始查分区（basis={basis}，单本约 1 秒，串行，勿并发）…",
+              flush=True)
+    zones = letpub_zone_many(items, verbose=verbose, refresh=refresh, basis=basis)
+    return {n: zones.get((issns.get(n) or None, n)) for n in name_to_doi}
 
 
 # ---------------------------------------------------------------- CLI
@@ -364,6 +696,16 @@ if __name__ == "__main__":
             refresh = True
         elif args[0] == "--letpub":     # 兼容老命令行，语义已统一
             pass
+        elif args[0] == "--allow-letpub":
+            ALLOW_LETPUB = True
+        elif args[0] == "--stats":
+            st = zone_stats()
+            if not os.path.exists(ZONE_XLSX):
+                save_zone_xlsx()      # 第一次跑就把表落盘，方便用户直接打开
+            print("分区表:", st["文件"])
+            for k in ("总数", "已收录", "未收录", "查询失败"):
+                print(f"  {k}: {st[k]}")
+            sys.exit(0)
         else:
             break
         args = args[1:]

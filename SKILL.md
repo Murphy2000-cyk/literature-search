@@ -1,176 +1,243 @@
 ---
 name: literature-search
-description: 学术文献检索（主源 Semantic Scholar）：3–4 轮 ≤5 词关键词、每轮 500 篇，BGE 排序 + 主题闸门，落盘 Excel 后按需读取；可按中科院新锐分区（LetPub，1–4 区）回填与筛选，缺摘要的 Elsevier 论文可走官方 API 补齐。当用户要"搜索文献""文献检索""找论文""查文献""查期刊分区""补摘要"，或做综述的资料收集时使用。
+description: 学术文献检索（主源 Semantic Scholar）：4 轮 ≤5 词关键词、每轮 300 篇，六个环节逐级筛选（检索→去重→近N年→记录合规→期刊等级→BGE排序），每环节落一份 Excel。期刊等级走 easyScholar（默认 JCR 1 区，可切中科院新锐），关键词与部分摘要由 OpenAlex 补齐，Elsevier 论文可走官方 API 补摘要。当用户要"搜索文献""文献检索""找论文""查文献""查期刊分区""补摘要"，或做综述的资料收集时使用。仅适用英文文献；中文文献改用 web_search + site:cnki.net，不要用本 skill。
 ---
 
 # 文献检索 Skill
 
-**版本 v2.0.1** · 遵循 Agent Skills 规范 · 所用智能体（Agent）不是 DSH 时见 `INSTALL.md` 第七节
+**版本 v2.2.0** · 遵循 Agent Skills 规范 · 所用智能体（Agent）不是 DSH 时见 `INSTALL.md` 第七节
 
-主数据源 Semantic Scholar 的学术文献检索，**一次检索 15–20 次 API 调用**：
-3–4 轮关键词（每轮 ≤5 词，各取 500 篇）→ BGE 每组独立评分 → 主题闸门 → 落盘 Excel → 按需读取。
+**详细说明见同目录 `AGENTS.md`；实测数据与历史记录见 `references/实测记录.md`；保存格式与使用示例见 `references/examples-and-details.md`。**
 
-**排错手册、故障复盘、闸门配置、归档规范见同目录 `AGENTS.md`；保存格式、使用示例、速率限制、BGE 排序说明见 `references/examples-and-details.md`。**
+## 何时用 / 不用
 
-## 目的
+- **用**：找英文论文、查期刊分区、给已有论文补摘要、做综述的资料收集。
+- **不用**：中文文献（改用 `web_search` + `site:cnki.net`）；只想读已知 DOI 的单篇（直接抓页面更快）。
 
-把"找文献"做成**少调用、快、可复现**的流程：一次抓够候选池并落盘，之后只按需读取其中一小部分，而不是把整份列表读进上下文。
+## 六个环节
 
-## 功能
+每个环节落一份 Excel，行数递减，逐级可核对。每一步的淘汰数写进 `筛选过程记录.md`，
+逐条明细写进 `筛选淘汰记录.xlsx`。
 
-| 环节 | 做什么 | 产物 |
+**第 0 层**：每次 S2 请求的原始响应原样存进 `<输出目录>/raw/r{n}_p{n}.json`，
+不裁剪字段、不解析、不丢记录、含跨轮重复。六件表都是它的视图，冲突时以它为准。
+
+| # | 环节 | 做什么 | 产物 |
+|---|---|---|---|
+| 1 | **原始检索** | 4 轮英文关键词（每轮 ≤5 词），每轮取 300 篇，**不设年份限制** | `第1环节_原始检索.xlsx` |
+| 2 | **去重** | 按 `paperId` 去重，记录「命中轮次 / 命中轮数」 | `第2环节_去重.xlsx` |
+| 3 | **近 N 年** | **默认近 10 年**，下界 = 今天 − 10 年（精确到日），只设下界；无日期且无年份的排除 | `第3环节_近N年.xlsx` |
+| 4 | **记录合规** | 剔除会议论文、会议录卷级条目、预印本、撤稿；标记版面元素、记录可疑 | `第4环节_记录合规.xlsx` |
+| 5 | **期刊等级** | easyScholar 查分区（默认 JCR 1 区），回填并归档到 `data/journal_zone.xlsx` | `第5环节_期刊等级.xlsx` |
+| 6 | **排序** | OpenAlex 取关键词与摘要 → BGE 单句主题打分 → 可选截取 → 补 Elsevier/PubMed 摘要 | `第6环节_相关度排序.xlsx` |
+
+**顺序不可随意调**：检索不设年份是为了保留全量原始数据（改 N 只改参数，不重花配额）；
+去重必须在最前（身份层操作，否则后续计数被重复记录污染）；年份与记录合规都是本地免费操作，
+排在分区之前；分区查询最贵（easyScholar 限 2 次/秒），必须最后做；摘要补全放到排序与截取之后，
+调用量只跟最终篇数有关。
+
+## 领域差异：计算机以会议为主
+
+**这条会改变默认筛选结果，用之前必须先选领域。**
+
+| 领域 | 主要发表渠道 | 本 skill 的默认行为 |
 |---|---|---|
-| **检索** | 3–4 轮 ≤5 词关键词，每轮 500 篇（5 页）→ 合并去重 | 候选池 |
-| **排序** | BGE 每组独立评分（**绝不用别组关键词打分**）→ 合并降序 | 带 BGE 分的表 |
-| **主题闸门** | 按本次题目配置的 2–3 个闸门（每闸门约 50 词）过滤 | 领域内候选 |
-| **落盘** | 全部元数据一次写成 xlsx（含 DOI/摘要/PDF 链接、疑似会议标记） | `<前缀>.xlsx` |
-| **分区** | `--enrich-zone` 回填**中科院新锐分区**（ISSN 精确匹配 + Crossref 反查 ISSN） | 「中科院分区」列 |
-| **摘要补全** | `abstract_fill.py`：Crossref → OpenAlex → Elsevier → PubMed → searchts 渲染 | 回填「摘要」列 + 「摘要来源」 |
-| **按需读取** | `--stats` / `--filter` / `--selected` / `--zone 1,2` | 只把需要的一小部分读进上下文 |
-| **备用** | 逐篇补详情（**一般不需要** —— DOI/摘要已随检索带回） | 仅在缺口时用 |
+| 工程、医学、材料等 | 期刊 | 排除会议论文与预印本（`--domain general`，默认） |
+| **计算机** | **顶会**（NeurIPS、ICML、ICLR、ACL、CVPR、SOSP、OSDI 等） | **默认放行单篇会议论文**（`--domain cs`） |
 
-模块：`semantic_scholar_search.py`（检索主流程）、`paper_details.py`（Phase 2）、`paper_table.py`（元数据表落盘与按需读取）、`topic_gate.py`（**主题闸门**）、`translator.py`（翻译）、`journal_quartile.py`（**分区：只做 LetPub 中科院新锐分区，按 ISSN 精确匹配**）、`venue_rules.py`（**会议论文集识别**）、`abstract_fill.py`（**摘要补全**）、`relevance_scorer.py`（BGE 排序）、`crossref_fallback.py`（备用源）。
+在计算机领域，顶会的审稿强度与影响力高于多数期刊，招聘与晋升也看顶会，所以用
+「只要期刊论文」的口径去检索 CS 题目，会把该领域的主体文献整个排除掉。
+
+```bash
+--domain cs              计算机领域，默认放行单篇会议论文
+--domain general         其它领域（默认），排除会议论文
+--allow-conference       无论领域，强制放行单篇会议论文
+--allow-preprint         放行预印本（arXiv / SSRN 等），默认排除
+```
+
+三条边界：
+
+1. **预印本不随领域自动放行。** CS 论文大多先挂 arXiv，是否放行由 `--allow-preprint`
+   单独决定。只放会议等于「只要经过同行评审的那部分」。
+2. **会议录卷级条目永远剔除**，不受任何开关影响。那是整本论文集的记录，不是单篇论文。
+3. **撤稿永远剔除**，不受任何开关影响。
+
+「会议」不等于同一质量：NeurIPS 论文与 `Journal of Physics: Conference Series` 上的
+会议论文差别极大。放行后靠第 5 环节的分区与人工复核兜住，不要在汇报里把两者混为一谈。
+
+## 数据种类清单（七类）
+
+| # | 数据 | 字段名 | 来源与顺序 |
+|---|---|---|---|
+| 1 | 题目 | `title` | Semantic Scholar |
+| 2 | 关键词 | `keywords` | **OpenAlex**（S2 无此字段，请求它会直接 400） |
+| 3 | DOI | `externalIds` | Semantic Scholar |
+| 4 | 作者信息 | `authors` | Semantic Scholar |
+| 5 | 期刊信息 | `journal` → `publicationVenue` → `venue` | **S2 三级回退，无任何外部途径** |
+| 6 | 摘要 | `abstract` | S2 → OpenAlex → Elsevier → PubMed |
+| 7 | 公开发表时间 | `publicationDate` / `year` | Semantic Scholar |
+
+**三级回退**指同一个 S2 响应里有三个字段可能装刊名，按序取第一个非空的。
+三个都空就标「刊名为空」，不删行，第 5 环节判「未查询到」，不去任何外部途径补。
+
+**字段存在性断言**（`assert_fields_cover()`）：启动时校验「代码要读取的字段」是否都被
+「请求的字段」覆盖，缺一个立刻抛错。**只校验键是否存在，绝不校验值是否为空** ——
+键不存在是代码 bug，键存在但值为空是数据事实。本 skill 不设任何「空值率超过 X% 就中止」的闸门。
+
+**六类必得**（题目 / DOI / 作者 / 期刊 / 发表时间 / 关键词）必须拿到，缺失要在完整性汇报里说明是数据源缺失；
+**摘要非硬性**，能拿多少算多少。`field_completeness()` 在第 1 与第 6 环节各统计一次并打印。
+
+## 三条贯穿全局的原则
+
+1. **筛选只对「有数据可判」的记录做判断，缺字段的直接排除。** 按年份筛只看有 `publicationDate` 或 `year` 的；按期刊筛只看有刊名的。缺字段的记为 `无数据可判`，与 `不符合条件` 分开统计，两类都要写进 `筛选淘汰记录.xlsx`。
+   无摘要标空、无刊名标「刊名为空」，全部保留行并标注，一个字都不许删。
+2. **禁止静默丢行。** 每一行被淘汰都要能说清在哪一环节、为什么。
+3. **换源必须经用户同意，且必须同时说明该源的缺失。** 不得只问「要不要换源」而不说代价。
+
+## 模块
+
+`search_pipeline.py`（**六环节编排，首选入口**）、`semantic_scholar_search.py`（S2 检索与 SDK）、
+`paper_table.py`（Excel 落盘与按需读取）、`journal_quartile.py`（分区查询与归档，easyScholar 主通道）、
+`venue_rules.py`（记录合规判定，六类判据集中于此）、`keyword_fetch.py`（OpenAlex 批量取关键词与摘要）、
+`relevance_scorer.py`（BGE 排序）、`abstract_fill.py`（Elsevier / PubMed 补摘要）、
+`paper_details.py`（按需补详情）、`translator.py`（翻译）、`crossref_fallback.py`（备用检索源，需授权）、
+`bge_status.py`（查看 BGE 内存占用）、`evals/`（自测脚本）。
+
+`topic_gate.py` 与 `gate_profiles.json` **保留但不再接入流水线**：主题过滤功能已取消，
+BGE 排序即可，泛领域论文靠排序与人工复核兜住。
 
 ## 使用方法
 
-**Phase 1**（Agent 写驱动脚本调用函数，无命令行入口）：
+```bash
+# 六环节一次跑完（推荐）
+python search_pipeline.py --out <目录> --topic "one sentence in English" \
+    --years 10 --zone-basis jcr --zone 1 \
+    "query one" "query two" "query three" "query four"
+
+# 只要部分环节、或对已有表操作
+python paper_table.py --xlsx <表> --filter --years 10 --zone 1 --top-n 20 --out <表> --quiet
+python paper_table.py --xlsx <表> --enrich-zone --zone-basis jcr
+python keyword_fetch.py <表>
+python abstract_fill.py <表>
+```
+
+编程调用：
 
 ```python
 import sys
-SKILL_DIR = r"<技能资源基底>"   # 取智能体给出的 Base directory，不要写死绝对路径
+SKILL_DIR = r"<技能资源基底>"      # 取智能体给出的 Base directory，不要写死绝对路径
 sys.path.insert(0, SKILL_DIR)
-from semantic_scholar_search import SemanticScholarSearcher, ApiUnavailableError
+from search_pipeline import run
 
-s = SemanticScholarSearcher()
-try:
-    papers = s.search_paginated(query="...", total_limit=100,
-                                publication_types=["JournalArticle", "Review"])
-except ApiUnavailableError as e:
-    ...   # 必须立即向用户汇报，不得当作"0 篇结果"，不得改用匿名请求
+paths = run(queries=["...", "...", "...", "..."],
+            topic="one sentence describing the topic in English",
+            out_dir=OUT, years=10, zone_basis="jcr", zone_filter=("1",))
+# 返回后【请让进程结束】—— BGE 占的内存只有进程退出才归还
 ```
 
-**Phase 2**：
+## 分区标准
 
-```bash
-python paper_details.py <paper_id> [<paper_id> ...]
-python paper_details.py --json 文献检索_筛选结果_xxx.json
+```
+--zone-basis jcr|xr    默认 jcr（JCR 四分位）
+--zone 1,2             默认 1
 ```
 
-**分区回填与摘要补全**：
+优先级：**用户明确要求 > 默认 JCR 1 区**。归档表 `data/journal_zone.xlsx` 同时存
+新锐分区、中科院升级版、中科院基础版、JCR 四套列，切换标准只换筛选参数，不动表结构。
 
-```bash
-python paper_table.py --xlsx 论文元数据.xlsx --enrich-zone        # 回填中科院分区
-python paper_table.py --xlsx 论文元数据.xlsx --filter --zone 1,2  # 只看 1~2 区
-python abstract_fill.py 论文元数据.xlsx                            # 补齐缺摘要的行
-```
+easyScholar 是**按刊名**查询的接口，ISSN 不是主键。查询顺序：原名 → 失败则规范化刊名重试
+→ 仍失败标「无法查询(会议论文/预印本/其他原因)」。限速 1 秒 1 次，已收录 60 天、
+未收录 30 天、查询失败一律重试。LetPub 仅作兜底，**必须经用户明确同意**才启用。
 
-**数据源三层**（各管一段，不可互相替代）：
+## 摘要补全
 
-| 层 | 来源 | 能做什么 | 限制 |
+四档顺序，逐档降级，仍缺则标「无摘要」不删行：
+
+| 档 | 时机 | 范围 | 说明 |
 |---|---|---|---|
-| 一 | **Semantic Scholar** | 主检索：标题/作者/年份/期刊/DOI/摘要/OA | 关键词检索、无布尔、约 1 请求/秒、摘要覆盖约 84% |
-| 二 | **Crossref** | 备用检索（S2 不可用时，需用户同意） | 只覆盖有 DOI 的文献；摘要约 28% |
-| 三 | **Elsevier API** | **只补 Elsevier 旗下论文的摘要** | 仅 `10.1016/*` 的论文；需 API key + 机构订阅 + **机构 IP**（授权按 IP，不按 key） |
+| 0 | 检索时 | 全部 | S2 自带 |
+| 1 | 排序前 | 全部 | OpenAlex，与取关键词**同一次批量请求**，零额外成本 |
+| 2 | 截取后 | 最终集合 | Elsevier，仅 `10.1016/`；判据是响应有无 `dc:description`，**不看状态码**（无权限也返回 200） |
+| 3 | 截取后 | 最终集合 | PubMed，按 DOI 反查 PMID |
 
-Elsevier key 从 <https://dev.elsevier.com> 注册获取，存 `~/.dsh/env.json` 的 `env.ELS_API_KEY`（代码不硬编码）。**校外无机构 IP 时该通道只会返回标识符、拿不到摘要**，属预期行为。
+三档补充全部依赖 DOI，**无 DOI 的记录补不到**，这是硬限制。
+Crossref 与网页渲染两档已删除，不要再加回来。
 
-**备用源 Crossref（必须先获用户同意，不得擅自启用）**：
+## BGE 排序
 
-S2 不可用时，**先向用户汇报失败情况，由用户决定是否改用 Crossref**。脚本带硬门禁，未加 `--approved-by-user` 会直接拒绝执行（退出码 3）。
-
-```bash
-python crossref_fallback.py --approved-by-user --out <目录> \
-  --keywords "nonlinear,contact,debonding" "查询1" "查询2"
+```
+主题描述句（一句英文，从用户需求提炼）
+  ├─ 与标题比     → s_title
+  └─ 与关键词串比  → s_kw
+最终分 = 有关键词 ? 0.6×s_title + 0.4×s_kw : s_title
 ```
 
-**Crossref 的硬性局限（必须在汇报中同时告知用户）**：
-
-- **只能检索到有 DOI 的文献**。无 DOI 的会议论文、区域性期刊、技术报告、标准等一律检索不到。
-- **摘要覆盖率低**（实测约 28%），多数条目只能靠标题判断相关性。
-- `query` 是**相关性排序检索**，只返回"最相关的前 N 条"，没有相关阈值，因此**不存在"确实未命中"**。
-- 单次 `rows` 上限 **1000**（实测 2000 被拒）；要更多需用 `cursor` 翻页。
-- ⚠️ **`cursor` 翻页必须同时显式传 `sort=relevance`**。实测漏掉它时，返回结果彻底失去相关性排序（前 100 条相关条目从 44 条跌到 1 条，内容变成牙种植体、超声心动图等无关文献）。已固化在 `crossref_fallback.py`，不得删除。
+- **4 组关键词只用于检索**，不参与打分（旧版一词两用，是误杀与漏排的来源）
+- **摘要不参与打分**：覆盖率不稳定，且加进去对名次几乎无影响
+- 默认纯分数降序，不掺「命中轮数」。命中轮数单独成列，需要时在 Excel 里自行重排
+- 打分模型固定英文分支 `BAAI/bge-base-en-v1.5`
 
 ## 如实汇报（最高优先级）
 
-**调研过程中的任何异常都必须如实、完整地汇报，不得隐瞒、美化或省略。** 结果交付时必须同时说明"完整性与可信度"。
-
-必须如实说明的情形：
+调研过程中的任何异常都必须如实、完整地汇报，不得隐瞒、美化或省略。
 
 | 情形 | 必须说明 |
 |---|---|
-| 完全没检索到文献 | 区分两种性质：**确实未命中**（查询正常完成、返回 0 条）还是**检索失败**（429 / 密钥不可用 / 网络异常）。后者**不能**得出"该领域没有文献"的结论 |
-| 只检索到部分文献 | 说明哪些查询失败、哪些达到抓取上限（可能仍有更多未取回）、范围被哪些筛选条件收窄 |
-| 中途换过数据源 | **换源必须先经用户同意**；说明何时、为何换源（如 S2 → Crossref）及口径差异（Crossref 只覆盖有 DOI 文献） |
-| 分区数据缺失 | 说明多少条因分区未收录被排除，可能漏掉本属 1/2 区的期刊 |
-| 摘要补全不齐 | 说明"补到 X/Y 篇"、各来源分布、未补到的是哪些篇与原因（最有价值的是区分"这篇本来没摘要"和"无订阅权限/校外 IP"） |
+| 完全没检索到文献 | 区分**确实未命中**（查询正常完成、返回 0 条）与**检索失败**（429 / 密钥 / 网络）。后者不能得出「该领域没有文献」的结论 |
+| 只检索到部分文献 | 说明哪些查询失败、哪些达到抓取上限、被哪些条件收窄 |
+| 中途换过数据源 | 换源必须先经用户同意，并说明判定标准不同 |
+| 分区数据缺失 | 说明多少行因「未查询到」被排除，可能漏掉本属 1 区的期刊 |
+| 摘要补全不齐 | 说明补到多少、各来源分布、未补到的是「本来没有」还是「无权限」 |
 | 人工去噪 | 说明剔除标准与数量，避免被当成全部命中 |
-| Phase 2 取回不齐 | 说明"取回 X/Y 篇"及未取回的 ID |
 
-**强制留痕**：`SemanticScholarSearcher` 会记录逐查询结果，必须调用并交付检索完整性报告：
-
-```python
-searcher.save_search_report(OUT)     # 产出 检索完整性报告.txt / .json
-rep = searcher.search_report()       # 结构化数据，写入调研日志
-```
-
-关键字段：`complete`（结果是否完整）、`queries_failed`、`queries_capped`、`papers_returned`、`notes`（自动生成的"须告知用户事项"）、`detail`（逐查询 status：`ok` / `capped` / `failed`）。
+**强制留痕**：`searcher.save_search_report(OUT)` 产出检索完整性报告；
+`run()` 自动产出 `筛选过程记录.md` 与 `筛选淘汰记录.xlsx`。这两份必须随结果一起交付。
 
 ## 注意点
 
-1. **失败即上报，绝不静默**：首次尝试失败后，各等待 **10s** 重试，共 **3 次请求**（累计约 20 秒）；仍失败即抛 `ApiUnavailableError`，**暂停检索并立即向用户提出二选一问题（按用户偏好排序）**：
-   > **1) 持续等待 3–5 分钟后重试**（首选：一般情况下优先等 S2 自行恢复）；还是 **2) 降级使用 Crossref 备用源**（最后手段）？
-
-   不得自行决定，不得继续遍历剩余查询，不得把失败当作"0 篇结果"。
-2. **换源必须经用户同意，且 Crossref 是最后手段**：S2 不可用时**先提问、后等用户决策**，不得擅自改用 Crossref。**用户的默认倾向是等待恢复**，不是换源。启用 Crossref 时**必须同时说明它只能检索到有 DOI 的文献**、摘要覆盖率低、且只返回相关性前 N 条。（Crossref 自身的限流/邮箱问题暂不处理，优先级低。）
-3. **不使用匿名请求**：未配置密钥直接报错；密钥请求失败也**不降级为匿名请求**（匿名走全局共享池，稳定性不可控）。不允许用"匿名兜底"。
-4. **不持续等待（需用户授权才可长等）**：默认到点即停。用户选择"持续等待"分支时，才把 `long_wait_on_failure = True`（静默 240 秒）重跑，且**只追加一次尝试**（共 4 次请求）。
-5. **失败不等于密钥失效**：2026-09-11 实测确认，S2 限流后会进入**约 60–110 秒的封锁期**，期间任何请求都是 429（静默 60s 后仍 429，约 44s 后自行恢复）；限流由 AWS API Gateway **按 key** 施加，**key 本身有效**。因此**不得向用户报告"密钥失效"**，应报告"服务端限流封锁中"。
-6. **禁止并发**：密钥约 1 请求/秒（脚本已设 2.5 秒间隔）。同一时间只跑一个检索进程，多查询放进同一个脚本串行循环。
-7. **不要凭单次成功判断恢复**：同一请求几秒内可能一次 200、一次 429；实测 1.5 秒间隔也会 429，1.0 秒间隔反而成功——**无规律，不能据此推断安全**。
-8. **分区只做中科院《新锐期刊分区表》（LetPub，1–4 区）**：JCR（Clarivate，基于 JIF 的四分位）**没有可用的免费数据源**——需 Web of Science / JCR 订阅，Clarivate API 付费，LetPub 检索页也不显示 JCR 四分位。第三方站点自算的"四分位"（如 journalmetrics 的 OpenAlex 口径）**不是 JCR**，不能当 JCR 汇报。故本 skill 只提供中科院分区，`--enrich-zone` 回填「中科院分区」列，`--zone 1,2` 筛选；传 `Q1/Q2` 会被**显式报错**拦下。
-   - **默认不按分区筛**：检索阶段分区是空的，要筛必须显式传 `quartile_filter=["1","2"]`。
-   - **查分区必须优先用 ISSN**（`letpub_zone(issn=…)`）：按刊名查会因缩写漏匹配（`Comput. Aided Civ. Infrastructure Eng.` 这类）。表里没有 ISSN 列，`--enrich-zone` 会自动用 Crossref 按 DOI 反查并缓存到 `.issn_cache.json`。
-   - ⚠️ **LetPub 单次查询会偶发返回空页**（实测 CBM 一次通一次空、MSSP 连续两次空）。旧实现把 `None` 永久写进缓存，导致 Materials、Applied Sciences、IEEE TIM、MSSP 等主流刊被判"未收录"。现在未收录项 **30 天后自动重查**，`--refresh` 可强制重查。
-   - ⚠️ **必须串行**：并发 >4 会被 LetPub 限流返空。单本约 **2.6–3.6 秒**（已改为优先 `--backend curl_cffi`，默认三级升级链要 7–9 秒）。
-9. **翻译可选**：缺 `ANTHROPIC_AUTH_TOKEN` 时自动跳过并保留英文，不算失败。
-10. **S2 是关键词检索，不是语义检索（2026-09 实测，详见 `AGENTS.md` §3.5）**：`/paper/search` **无布尔语法**（写 `AND`/`OR`/引号会被当普通文本）；匹配范围**含摘要**，所以技术术语可以放心写进查询词。⚠️ **查询词越长，实际返回量越少**（2026-09-20 对照实测：7 词→100 篇，同一查询加到 9 词→**11 篇**，13 词→**6 篇**）—— **单条查询最多 5 个关键词，超限代码直接报错**。详见 `AGENTS.md` §3.5.4.1。⚠️ **`total` 字段不可信，绝不能用它说明"某领域有多少文献"**（实测加一个词会导致数值涨 65 倍）。需要布尔语法或超过 1000 条时，改用 `/paper/search/bulk`。
-11. **标准检索方案（用户 2026-09-20 定稿，详见 `AGENTS.md` §3.6）**：**固定 3–4 轮关键词，每轮 ≤5 词、互为微调变体，每轮取 500 篇（默认 = 5 页，可自定义）** → **BGE 每组独立评分** → 合并去重、按分全局降序 → 取前 N（**默认不截断**）→ 一次性落盘成一个 Excel → 之后按需读取。⚠️ **每组关键词只给它自己检索到的文献评分，绝不串组**。一步到位的入口是 `search_pipeline.run()`。
-    - **每轮篇数默认 500，用户可自定义**：`run(per_round=300)` 或 `--per-round 300`（300 → 每轮 3 页）。**入表篇数另由 `top_n` / `--top-n` 控制（默认不限 = 闸门后全量入表），两者独立**。⚠️ **三个数别混**：单页 100 篇（S2 硬上限）→ 每轮 500 篇 = **5 次请求** → 入表默认不截断（要压小用 `--top N`）。只有改"每轮"才增加请求。
-    - ⚠️ **不做探针轮**。轮的"微调变体"本身就承担试探作用，不要再单独发请求试词（那既费调用数，还可能把 key 推进 429 封锁期）。
-    - ⚠️ **请求间隔 4 秒**（`SemanticScholarSearcher.REQUEST_INTERVAL = 4.0`，2026-09-20 由 2.5 上调）。官方限 1 RPS，留足余量换取更少 429。
-    - ⚠️ **API 调用预算：`ceil(per_round/100) × 轮数`**，默认即 5×3–4 = **15–20 次请求**（+少量 429 重试；4 轮 500 篇的实测就是 20 次）。检索响应已直接带回 **DOI / 摘要 / OA 链接**，**不要再跑 Phase 2 逐篇补详情**（实测 DOI 覆盖 88–95%、摘要 74%，调用数 +0）。
-    - ⚠️ **S2 不可用即刻上报**：任一轮失败即保全已取回结果、落盘完整性报告并抛出，立即向用户汇报（不静默、不换源、不用匿名请求）。
-    - ⚠️ **BGE 排序是「词面」相似度，不等于语义相关度**：纯排序会把与题目无关的论文（纯综述、别的领域的同名术语）排到前面，把最对题的压到几十名开外。**向用户交付"最相关的 N 篇"时，必须先过主题闸门 `topic_gate.py` + 人工复核**。
-    - ⚠️ **闸门是按主题配置的，不是一套词表打天下**。每次检索都要为**本次题目**准备一条 profile：**2–3 个闸门（轴），每轴约 50 词**。内置的 `building-envelope-ndt` 只覆盖「建筑围护结构/外保温无损检测」；实测拿它去判别的题目，13 个真实标题只过 3 个（通过率 0% 的题目有两个）。
-    - ✅ **闸门已接进流水线**：`run(..., gate_profile="<id>")`，顺序是**全量排序 → 过闸门 → 截断到 top_n**（顺序颠倒会浪费名额）。返回值带 `gate` 统计（before/after/rejected/靠标题命中/靠摘要命中）。全被剔除时**直接报错**，不静默交付空表。
-    - ✅ **闸门按「标题 + 摘要」判**（摘要随检索已带回，覆盖 74–76%）。方法只写在摘要里、标题没提的论文不再被误杀。返回的 `_source` 标明这次通过靠标题还是靠摘要 —— 靠标题的更可信。
-    - 用法：`run(..., gate_profile=...)`／`topic_gate.gate(标题, profile, 摘要)`／`apply_gate(列表, profile)`（**自带"过窄自检"**：放行率低于阈值会告警"配置过窄、正在误杀"）／`save_profile(...)` 存进 `gate_profiles.json`；命令行 `python topic_gate.py --list-profiles`、`--explain "标题" --profile <id>`；检索侧 `--gate-profile <id>`。闸门配置与真实分数要落盘留痕，**不得改动打分数值**。详见 `AGENTS.md` §3.5.4.2。
-12. **BGE 用英文分支，内存靠"退进程"归还（详见 `AGENTS.md` §3.6）**：论文检索固定 `lang="en"`（实测查询词即便是纯中文，也只加载 `bge-base-en-v1.5`，不会拉起 780 MB 的中文分支）。BGE 用 `bge-base`（与知识库同一套，本地有缓存），**首次加载约 100 秒**。⚠️ **进程内无法把内存还给系统**（实测 `del`+`gc` 只还 7 MB，工作集修剪是假象）——**唯一可靠的方式是让进程退出**，所以要么用 `search_pipeline.run()` 一次做完再退，要么别在一个长驻进程里反复加载。
-13. **会议论文集要靠刊名识别，`publication_types` 挡不住**：S2 会把 `e-Journal of Nondestructive Testing`（NDT.net 会议录）、`Journal of Physics: Conference Series`、`E3S Web of Conferences`、`INTER-NOISE` 这类**标成 `JournalArticle`**。实测 553 篇里标 Conference 的仅 27 篇，另有 **99 篇**属此类。`venue_rules.is_conference_venue()` 负责按刊名判，落盘时写进「疑似会议」列；`filter_papers` 的 `journal_only` 已接入。⚠️ 白名单保证 `Proceedings of the Institution of Mechanical Engineers` 这类**正规期刊**不被误杀。
+1. **失败即上报，绝不静默。** 采用**指数退避**（10s → 20s → 40s，累计约 70 秒，
+   覆盖官方与实测的 60~110 秒封锁窗口），共 3 次重试；仍失败即抛
+   `ApiUnavailableError`，暂停并**立即向用户提出二选一**：① 等待 3~5 分钟后重试（首选）；
+   ② 改用 Crossref 备用源（最后手段，须说明其缺失）。不得自行决定，不得继续遍历剩余查询。
+2. **不使用匿名请求。** 未配置密钥直接报错；失败也不降级为匿名。
+3. **严格串联，不靠换端点绕过限流。** 官方口径是**带 key 配额 1 RPS、全端点共享**，
+   且高峰期会被进一步压制。所以：单进程串行、全局限速器覆盖所有端点、
+   遇到 429 只退避等待，绝不改走另一个端点（换端点不能绕过配额）。
+3. **失败不等于密钥失效。** S2 限流后会进入封锁期，期间一律 429，key 本身有效。
+   应报「服务端限流封锁中」，不得报「密钥失效」。
+4. **禁止并发。** 同一时间只跑一个检索进程，多查询串行。
+5. **不要凭单次成功判断恢复。** 同一请求几秒内可能一次 200 一次 429，间隔大小与成败无稳定关系。
+6. **S2 是关键词检索，不是语义检索。** `/paper/search` 无布尔语法；匹配范围含摘要；
+   **单条查询最多 5 个关键词**（超限直接报错）；**`total` 字段不可信**，绝不能用它说明
+   「某领域有多少文献」。需要布尔语法或超过 1000 条时改用 `/paper/search/bulk`。
+7. **不做探针轮。** 各轮的「微调变体」本身承担试探作用。
+8. **BGE 只加载一次，靠进程退出释放内存。** 进程内无法把 torch 占的内存还给系统。
+9. **禁止用「标题词数」或「全大写」判断记录类别。** 短标题里有真论文，全大写长标题在
+   老文献里极常见。唯一可用的是精确认词表。
+10. **会议规则必须配正规期刊白名单**，否则会误杀
+    `Proceedings of the Institution of Mechanical Engineers` 这类正规期刊。
+11. **撤稿与勘误分开处理**：撤稿剔除并单独记数；勘误的原文有效，只标记不剔除。
+12. **翻译可选。** 缺 `ANTHROPIC_AUTH_TOKEN` 时自动跳过并保留英文，不算失败。
 
 ## 容易遇到的问题
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `ApiUnavailableError: Semantic Scholar 连续 3 次请求均失败` | 服务端限流封锁（约 60–110 秒） | **立即向用户提问**：降级 Crossref，还是等待 3–5 分钟后重试。**不要说成"密钥失效"** |
-| 想直接换用 Crossref | — | **不得擅自换源**。先提问，并说明 Crossref 只能检索到有 DOI 的文献、摘要覆盖率低，由用户决定 |
-| `未配置 SEMANTIC_SCHOLAR_API_KEY` | 密钥缺失 | 提示用户配置；不使用匿名请求兜底 |
-| 长时间无输出，最后返回 0 篇 | 旧版静默失败 | 已由失败上报机制修复；确认捕获了 `ApiUnavailableError` |
-| 检索结果为 0 篇 | 可能确实未命中，也可能是查询失败 | 用 `search_report()` 判断：`complete=true` 才算"确实未命中"，否则须说明是检索失败 |
-| 只取回部分文献 | 部分查询失败或达到抓取上限 | 报告中的 `queries_failed` / `queries_capped` 会指出；汇报时必须说明结果不完整 |
-| 报告把故障记成 `[ok]` | 请求失败被当成"空结果"（v1.3.4 已修） | 只有 `200` + 空 `data` 才是 `ok`；`5xx`/网络错误一律 `failed` |
-| 失败后部分结果丢失 | 翻页中断时 `return` 未执行（v1.3.4 已修） | 捕获异常后必须用 `searcher.collected_partial()` 取回并落盘 |
-| 结果大量 off-topic | 关键词过宽（如泛用 GPR/thermal） | 缩窄查询词，对标题做相关性打分后再呈现 |
-| 分区大量未收录 | 该刊未被分区库收录 | 属预期，说明局限；需要按 ISSN 精确重查时用 `journal_quartile.letpub_zone(issn=...)`，不要按刊名查 |
-| 输出目录不符预期 | 默认 `~/literature-search-out` | 设 `LITSEARCH_OUT_DIR`，或按 `AGENTS.md` 归档规范指定 |
+| `ApiUnavailableError` | 服务端限流封锁 | 立即向用户提问：等待重试，还是改用 Crossref。**不要说成密钥失效** |
+| `AssertionError: 请求字段未覆盖解析字段` | 有人新增了读取字段却没加进 `S2_FIELDS_LIST` | 补进该常量，不要在调用处临时拼字段串 |
+| 刊名整列为空 | 请求里漏了 `journal` / `publicationVenue` | 检查 `S2_FIELDS`，并确认 `_parse_paper` 走的是三级回退 |
+| 分区大量「未查询到」 | 刊名为空，或该刊未被分区库收录 | 先看「期刊」列是否为空；属预期时如实说明局限 |
+| 检索结果 0 篇 | 可能确实未命中，也可能查询失败 | 用 `search_report()` 判断，`complete=true` 才算确实未命中 |
+| 输出目录不符预期 | 默认 `~/literature-search-out` | 设 `LITSEARCH_OUT_DIR`，或显式传 `out_dir` |
 
 ## 资源导航
 
 | 资源 | 何时读 |
 |---|---|
-| `AGENTS.md` | 排错细节、2026-09 故障复盘、文件归档规范、驱动脚本模板 |
-| `AGENTS.md` §3.6 | **论文元数据表**（Excel 落盘 + 按需读取）的完整用法与三条硬约束 |
-| `references/examples-and-details.md` | 产出文件格式（初筛 / 筛选结果 / JSON）、4 个使用示例、API Key 申请、速率限制、BGE 排序原理、paper_id 与 DOI 索引用法 |
+| `AGENTS.md` | 机制细节、驱动脚本模板、排错手册、归档规范 |
+| `references/实测记录.md` | 需要查历史实测数据时（数字都带日期与语料说明） |
+| `references/easyscholar-api.md` | 改分区接口时的字段陷阱与调试清单 |
+| `references/journal-name-issues.md` | 刊名匹配不上时的规范化规则 |
+| `references/examples-and-details.md` | 产出文件格式、使用示例、速率限制 |
 
-脚本都在本 skill 目录下。引用时按智能体给出的**技能资源基底**解析相对路径，不要写死绝对路径（技能可能来自远程来源）。
+脚本都在本 skill 目录下。引用时按智能体给出的**技能资源基底**解析相对路径，不要写死绝对路径。
